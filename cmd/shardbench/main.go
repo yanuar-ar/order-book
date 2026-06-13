@@ -94,7 +94,7 @@ func runWorker(idx int, markets []types.MarketID, dur time.Duration, users int) 
 	r := rand.New(rand.NewSource(int64(idx) + 1))
 	engines := make(map[types.MarketID]*matching.Engine, len(markets))
 	for _, m := range markets {
-		e := matching.NewEngine(orderbook.New(m, 1<<20), noopSink{})
+		e := matching.NewEngine(orderbook.New(m, 1<<20), noopSink{}, qtyDiv)
 		seedBook(e, m, r, users)
 		engines[m] = e
 	}

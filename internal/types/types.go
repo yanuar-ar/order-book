@@ -133,6 +133,10 @@ type FundedOrder struct {
 	StopPrice  Price
 	Qty        Qty
 	DisplayQty Qty
+	// MaxQuote bounds the quote a market buy may spend (notional units, set by
+	// the balance authority from the reservation). 0 means unbounded (limit
+	// orders and sells); it stops a no-price-limit buy from out-spending funds.
+	MaxQuote int64
 }
 
 // AckStatus is the outcome reported back to the client.

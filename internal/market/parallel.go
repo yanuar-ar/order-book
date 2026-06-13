@@ -177,7 +177,7 @@ func NewParallelEngine(cfg Config, groups [][]types.MarketID) *ParallelEngine {
 		coll := &collector{}
 		wshards := make(map[types.MarketID]*Shard, len(g))
 		for _, m := range g {
-			s := NewShard(m, cfg.CapHint)
+			s := NewShard(m, cfg.CapHint, cfg.QtyScale)
 			s.SetSink(coll)
 			pe.impls[m] = s
 			wshards[m] = s

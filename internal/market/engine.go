@@ -80,10 +80,17 @@ func (c *Core) newOrder(cmd types.Command) {
 	_, isActivation := c.open[cmd.OrderID]
 
 	if !isActivation {
+		// A market buy bounds its spend to the reservable quote budget.
+		if funded.OrdType == types.Market && funded.Side == types.Buy {
+			funded.MaxQuote = c.ledger.MarketBuyBudget(funded.Account, funded.Market)
+		}
 		if reason, ok := c.ledger.Reserve(funded); !ok {
 			c.ack(cmd, types.AckRejected, reason)
 			return
 		}
+	} else if funded.OrdType == types.Market && funded.Side == types.Buy {
+		// Activated stop-market buy reuses its existing reservation's budget.
+		funded.MaxQuote = c.ledger.OrderBudget(funded.OrderID)
 	}
 
 	sh := c.shards[cmd.Market]
@@ -235,7 +242,7 @@ func NewEngine(cfg Config) *Engine {
 	impls := make(map[types.MarketID]*Shard, len(cfg.Markets))
 	shards := make(map[types.MarketID]shardOps, len(cfg.Markets))
 	for m := range cfg.Markets {
-		s := NewShard(m, cfg.CapHint)
+		s := NewShard(m, cfg.CapHint, cfg.QtyScale)
 		impls[m] = s
 		shards[m] = s
 	}

@@ -20,11 +20,12 @@ type Shard struct {
 	engine *matching.Engine
 }
 
-// NewShard builds a shard for market with an arena capacity hint. The stop
-// activation sink is installed later via SetSink (engine assembly wires it to
-// the sequencer's re-injection entry).
-func NewShard(market types.MarketID, capHint int) *Shard {
-	return &Shard{Market: market, engine: matching.NewEngine(orderbook.New(market, capHint), nil)}
+// NewShard builds a shard for market with an arena capacity hint and the
+// quantity scale (for market-buy funds capping). The stop activation sink is
+// installed later via SetSink (engine assembly wires it to the sequencer's
+// re-injection entry).
+func NewShard(market types.MarketID, capHint int, qtyScale int64) *Shard {
+	return &Shard{Market: market, engine: matching.NewEngine(orderbook.New(market, capHint), nil, qtyScale)}
 }
 
 // SetSink installs the stop-activation sink.

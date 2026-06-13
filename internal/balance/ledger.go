@@ -113,7 +113,10 @@ func (l *Ledger) Reserve(o types.FundedOrder) (types.RejectReason, bool) {
 	spec := l.cfg.Markets[o.Market]
 	if o.Side == types.Buy {
 		var cost int64
-		if o.OrdType == types.Market {
+		// Market and Stop (which triggers to Market) have no price limit, so
+		// they reserve the full available quote; Limit and Stop-Limit reserve
+		// notional at their price plus the worst-case taker fee.
+		if o.OrdType == types.Market || o.OrdType == types.Stop {
 			cost = l.Available(o.Account, spec.Quote)
 			if cost <= 0 {
 				return types.ReasonInsufficientFunds, false
@@ -177,6 +180,37 @@ func (l *Ledger) Settle(f types.Fill) {
 	}
 
 	l.fees[spec.Quote] += buyerFee + sellerFee
+}
+
+// budgetFromQuote returns the maximum notional a buyer can fill for a reserved
+// quote amount q, leaving room for the taker fee: maxNotional + takerFee ≤ q.
+func (l *Ledger) budgetFromQuote(q int64) int64 {
+	if q <= 0 {
+		return 0
+	}
+	b, ok := types.MulDiv(q, l.cfg.FeeScale, l.cfg.FeeScale+l.cfg.TakerFee, false)
+	if !ok {
+		return q
+	}
+	return b
+}
+
+// MarketBuyBudget returns the notional budget for a market buy that reserves the
+// account's full available quote in the given market. Used to bound the
+// matcher's sweep so it never out-spends funds.
+func (l *Ledger) MarketBuyBudget(acct types.AccountID, market types.MarketID) int64 {
+	spec := l.cfg.Markets[market]
+	return l.budgetFromQuote(l.Available(acct, spec.Quote))
+}
+
+// OrderBudget returns the notional budget derived from an existing order's
+// remaining reservation (used when a stop activates into a market buy).
+func (l *Ledger) OrderBudget(orderID types.OrderID) int64 {
+	r, ok := l.res[orderID]
+	if !ok {
+		return 0
+	}
+	return l.budgetFromQuote(r.remaining)
 }
 
 // AmendReduce shrinks an open order's reservation to match a reduced quantity,

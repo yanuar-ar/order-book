@@ -21,14 +21,20 @@ type Sink interface {
 
 // Engine matches funded orders against one market's book.
 type Engine struct {
-	book  *orderbook.Book
-	sink  Sink
-	stops []stopOrder
+	book     *orderbook.Book
+	sink     Sink
+	qtyScale int64
+	stops    []stopOrder
 }
 
 // NewEngine returns an engine over book, emitting stop activations to sink.
-func NewEngine(book *orderbook.Book, sink Sink) *Engine {
-	return &Engine{book: book, sink: sink}
+// qtyScale is the fixed-point quantity scale, used to bound market-buy spend
+// against the order's MaxQuote budget.
+func NewEngine(book *orderbook.Book, sink Sink, qtyScale int64) *Engine {
+	if qtyScale <= 0 {
+		qtyScale = 1
+	}
+	return &Engine{book: book, sink: sink, qtyScale: qtyScale}
 }
 
 // SetSink replaces the stop-activation sink. Used by engine assembly to wire
@@ -112,6 +118,7 @@ func (e *Engine) matchActive(o types.FundedOrder) Result {
 
 	remaining := o.Qty
 	var matchIdx uint32
+	var spentQuote int64 // accumulated quote for a budget-bounded market buy
 	for remaining > 0 {
 		front, ok := e.book.FrontResting(oppSide)
 		if !ok || !crosses(o.Side, o.Price, o.OrdType, front.Price) {
@@ -126,6 +133,27 @@ func (e *Engine) matchActive(o types.FundedOrder) Result {
 		x := remaining
 		if front.Display < x {
 			x = front.Display
+		}
+		// Funds cap: a market buy may not spend beyond its MaxQuote budget. The
+		// cap is keyed on order type (not MaxQuote > 0) so a zero budget
+		// correctly fills nothing rather than being mistaken for "unlimited".
+		if o.OrdType == types.Market && o.Side == types.Buy {
+			q, ok := types.Notional(front.Price, x, e.qtyScale, true)
+			if !ok || spentQuote+q > o.MaxQuote {
+				rem := o.MaxQuote - spentQuote
+				if rem <= 0 {
+					break
+				}
+				maxX, ok2 := types.MulDiv(rem, e.qtyScale, int64(front.Price), false)
+				if !ok2 || maxX <= 0 {
+					break
+				}
+				if types.Qty(maxX) < x {
+					x = types.Qty(maxX)
+				}
+				q, _ = types.Notional(front.Price, x, e.qtyScale, true)
+			}
+			spentQuote += q
 		}
 		res.Fills = append(res.Fills, e.buildFill(o, front, x, matchIdx))
 		matchIdx++
