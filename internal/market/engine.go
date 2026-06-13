@@ -328,6 +328,9 @@ func (e *Engine) Ledger() *balance.Ledger { return e.core.ledger }
 // Shard returns the shard for a market.
 func (e *Engine) Shard(m types.MarketID) *Shard { return e.impls[m] }
 
+// Filters returns the per-market order filters (read access for invariants).
+func (e *Engine) Filters() map[types.MarketID]types.MarketFilters { return e.core.filters }
+
 // MarketIDs returns the engine's market IDs in ascending order.
 func (e *Engine) MarketIDs() []types.MarketID {
 	ids := make([]types.MarketID, 0, len(e.core.shards))

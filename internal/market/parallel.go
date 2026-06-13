@@ -243,6 +243,9 @@ func (pe *ParallelEngine) Ledger() *balance.Ledger { return pe.core.ledger }
 // quiesced) or Close (workers stopped) to avoid racing the worker.
 func (pe *ParallelEngine) Shard(m types.MarketID) *Shard { return pe.impls[m] }
 
+// Filters returns the per-market order filters (read access for invariants).
+func (pe *ParallelEngine) Filters() map[types.MarketID]types.MarketFilters { return pe.core.filters }
+
 // Acks returns captured acks.
 func (pe *ParallelEngine) Acks() []types.Ack { return pe.core.acks }
 
