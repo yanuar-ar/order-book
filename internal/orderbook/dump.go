@@ -32,3 +32,30 @@ func (b *Book) Dump() []RestingDump {
 	appendSide(types.Sell, b.askPrices)
 	return out
 }
+
+// PriceLevel is an aggregated price level: total visible quantity at a price.
+type PriceLevel struct {
+	Price types.Price
+	Qty   types.Qty
+}
+
+// Depth returns up to n price levels for a side, best price first (highest bid /
+// lowest ask), each with its total visible quantity. Used for market-data and
+// terminal display.
+func (b *Book) Depth(side types.Side, n int) []PriceLevel {
+	out := make([]PriceLevel, 0, n)
+	if side == types.Buy {
+		// bidPrices ascending; best (highest) is last.
+		for i := len(b.bidPrices) - 1; i >= 0 && len(out) < n; i-- {
+			p := b.bidPrices[i]
+			out = append(out, PriceLevel{Price: p, Qty: b.bidLevels[p].totalQty})
+		}
+	} else {
+		// askPrices ascending; best (lowest) is first.
+		for i := 0; i < len(b.askPrices) && len(out) < n; i++ {
+			p := b.askPrices[i]
+			out = append(out, PriceLevel{Price: p, Qty: b.askLevels[p].totalQty})
+		}
+	}
+	return out
+}
