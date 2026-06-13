@@ -179,6 +179,35 @@ func (l *Ledger) Settle(f types.Fill) {
 	l.fees[spec.Quote] += buyerFee + sellerFee
 }
 
+// AmendReduce shrinks an open order's reservation to match a reduced quantity,
+// releasing the freed funds to available. It recomputes the new requirement
+// (notional + worst-case taker fee for a buy; base qty for a sell) and releases
+// only the excess, so the remaining reservation never under-covers. newQty must
+// be the order's new total remaining quantity.
+func (l *Ledger) AmendReduce(orderID types.OrderID, side types.Side, price types.Price, newQty types.Qty) bool {
+	r, ok := l.res[orderID]
+	if !ok {
+		return false
+	}
+	var newReq int64
+	if side == types.Buy {
+		notional, ok := types.Notional(price, newQty, l.cfg.QtyScale, true)
+		if !ok {
+			return false
+		}
+		fee, _ := types.Fee(notional, l.cfg.TakerFee, l.cfg.FeeScale, true)
+		newReq = notional + fee
+	} else {
+		newReq = int64(newQty)
+	}
+	if r.remaining > newReq {
+		rel := r.remaining - newReq
+		l.move(r.acct, r.asset, rel, -rel)
+		r.remaining = newReq
+	}
+	return true
+}
+
 // Release returns an order's leftover reservation to available funds, used when
 // the order completes (fully filled, or remainder cancelled) or is cancelled.
 func (l *Ledger) Release(orderID types.OrderID) bool {
