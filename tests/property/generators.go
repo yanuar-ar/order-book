@@ -52,6 +52,23 @@ type Stream struct {
 	NetDeposits map[types.AssetID]int64
 }
 
+// standardPrelude returns a generously-funded deposit prelude and its
+// net-deposits map. Shared by the fuzz target and state-machine test, which
+// supply their own order streams.
+func standardPrelude() ([]types.Command, map[types.AssetID]int64) {
+	net := map[types.AssetID]int64{}
+	var deps []types.Command
+	for a := types.AccountID(1); a <= genAccounts; a++ {
+		deps = append(deps, types.Command{Type: types.CmdDeposit, Account: a, Asset: genQuote, Amount: 1_000_000})
+		net[genQuote] += 1_000_000
+		for _, b := range genBases {
+			deps = append(deps, types.Command{Type: types.CmdDeposit, Account: a, Asset: b, Amount: 10_000})
+			net[b] += 10_000
+		}
+	}
+	return deps, net
+}
+
 // GenBroad builds a uniform-random stream over wide price/qty bands with
 // generous balances. It exercises every order type but most orders do not
 // cross. Pure function of (seed, n).
