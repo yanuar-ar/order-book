@@ -37,6 +37,15 @@ var marketName = map[types.MarketID]string{0: "BTC/USDT", 1: "ETH/USDT", 2: "SOL
 // market routing weights: BTC 50%, ETH 30%, SOL 20% (design §18.3).
 var marketWeights = []types.MarketID{0, 0, 0, 0, 0, 1, 1, 1, 2, 2}
 
+const (
+	// Price model: integer ticks where 1 tick = $0.01, base mid = $100.00.
+	// This gives a realistic deep ladder and decimal price display.
+	baseMid   types.Price = 10_000
+	priceDiv              = 100.0 // ticks -> dollars for display
+	depthBand             = 60    // maker orders rest up to this many ticks from mid
+	maxQtyGen             = 50
+)
+
 func main() {
 	tps := flag.Int("tps", 100_000, "target throughput (commands/second)")
 	dur := flag.Duration("duration", 2*time.Minute, "test duration")
@@ -67,14 +76,17 @@ func main() {
 		}
 	}
 	eng.Drain()
-	// Seed initial liquidity around mid=100 so the book is populated at start.
+	// Seed a deep initial ladder around mid so the book looks like a real one
+	// at start: many resting levels on each side stepping away from the touch.
 	var id types.OrderID = 1
 	for m := range marketBase {
-		for i := 0; i < 500; i++ {
-			id++
-			eng.Submit(order(m, acct(r, *users), id, types.Buy, types.Limit, types.GTC, types.Price(90+r.Intn(10)), types.Qty(1+r.Intn(9))))
-			id++
-			eng.Submit(order(m, acct(r, *users), id, types.Sell, types.Limit, types.GTC, types.Price(101+r.Intn(10)), types.Qty(1+r.Intn(9))))
+		for off := types.Price(1); off <= depthBand; off++ {
+			for k := 0; k < 3; k++ { // a few resting orders per price level
+				id++
+				eng.Submit(order(m, acct(r, *users), id, types.Buy, types.Limit, types.GTC, baseMid-off, types.Qty(1+r.Intn(maxQtyGen))))
+				id++
+				eng.Submit(order(m, acct(r, *users), id, types.Sell, types.Limit, types.GTC, baseMid+off, types.Qty(1+r.Intn(maxQtyGen))))
+			}
 		}
 	}
 	eng.Drain()
@@ -98,7 +110,7 @@ func main() {
 			// busy-wait: time.Sleep is too coarse for ~10µs pacing
 		}
 		id++
-		c := genOrder(r, id, *users)
+		c := genOrder(eng, r, id, *users)
 		if !eng.Submit(c) {
 			backpressure++
 		}
@@ -131,32 +143,58 @@ func order(m types.MarketID, a types.AccountID, id types.OrderID, side types.Sid
 	return types.Command{Type: types.CmdNewOrder, Market: m, Account: a, OrderID: id, Side: side, OrdType: typ, Tif: tif, Price: price, Qty: qty}
 }
 
-// genOrder produces a realistic mix: mostly crossing limits (so trades occur and
-// the price moves), some market/IOC sweeps, and occasional cancels.
-func genOrder(r *rand.Rand, id types.OrderID, users int) types.Command {
-	m := marketWeights[r.Intn(len(marketWeights))]
-	a := acct(r, users)
-	switch n := r.Intn(100); {
-	case n < 8: // cancel a recent order (no-op if already gone)
-		return types.Command{Type: types.CmdCancel, Market: m, Account: a, OrderID: id - types.OrderID(1+r.Intn(4000))}
-	case n < 18: // market order sweeps liquidity
-		return order(m, a, id, types.Side(r.Intn(2)), types.Market, types.GTC, 0, types.Qty(1+r.Intn(5)))
-	case n < 23: // IOC
-		side := types.Side(r.Intn(2))
-		return order(m, a, id, side, types.Limit, types.IOC, crossPrice(r, side), types.Qty(1+r.Intn(5)))
-	default: // limit, often crossing to generate trades
-		side := types.Side(r.Intn(2))
-		return order(m, a, id, side, types.Limit, types.GTC, crossPrice(r, side), types.Qty(1+r.Intn(9)))
+// midPrice estimates the current mid from the touch, falling back to the last
+// trade or the base mid when a side is empty.
+func midPrice(bk *orderbook.Book) types.Price {
+	bid, okb := bk.BestBid()
+	ask, oka := bk.BestAsk()
+	switch {
+	case okb && oka:
+		return (bid + ask) / 2
+	case okb:
+		return bid
+	case oka:
+		return ask
 	}
+	if lp, ok := bk.LastPrice(); ok {
+		return lp
+	}
+	return baseMid
 }
 
-// crossPrice biases buys high and sells low so orders frequently cross the
-// 95..105 band, producing trades and visible price movement.
-func crossPrice(r *rand.Rand, side types.Side) types.Price {
-	if side == types.Buy {
-		return types.Price(98 + r.Intn(8)) // 98..105
+// genOrder models real order-book dynamics relative to the live mid: most
+// orders are makers that rest away from the touch and build a deep ladder; a
+// minority are takers (market / crossing IOC) that consume the touch and move
+// the price; a few are cancels that churn resting liquidity.
+func genOrder(eng *market.Engine, r *rand.Rand, id types.OrderID, users int) types.Command {
+	m := marketWeights[r.Intn(len(marketWeights))]
+	a := acct(r, users)
+	side := types.Side(r.Intn(2))
+	qty := types.Qty(1 + r.Intn(maxQtyGen))
+	mid := midPrice(eng.Shard(m).Book())
+
+	switch n := r.Intn(100); {
+	case n < 8: // cancel a recent order (no-op if already gone)
+		return types.Command{Type: types.CmdCancel, Market: m, Account: a, OrderID: id - types.OrderID(1+r.Intn(8000))}
+	case n < 20: // taker: market order sweeps the touch
+		return order(m, a, id, side, types.Market, types.GTC, 0, qty)
+	case n < 26: // taker: crossing IOC a few ticks through the touch
+		px := mid + types.Price(2+r.Intn(5))
+		if side == types.Sell {
+			px = mid - types.Price(2+r.Intn(5))
+		}
+		return order(m, a, id, side, types.Limit, types.IOC, px, qty)
+	default: // maker: rest away from the touch, building the depth ladder
+		off := types.Price(1 + r.Intn(depthBand))
+		px := mid - off // bid below mid
+		if side == types.Sell {
+			px = mid + off // ask above mid
+		}
+		if px < 1 {
+			px = 1
+		}
+		return order(m, a, id, side, types.Limit, types.GTC, px, qty)
 	}
-	return types.Price(95 + r.Intn(8)) // 95..102
 }
 
 // ---- live display ----
@@ -235,23 +273,23 @@ func render(f *frame) {
 	// Asks: print worst (highest) at top down to best (lowest) just above the spread.
 	for i := len(f.asks) - 1; i >= 0; i-- {
 		lv := f.asks[i]
-		fmt.Fprintf(&b, "%s  %8d  %6d %s%s\n", red, lv.Price, lv.Qty, bar(lv.Qty, maxQty), reset)
+		fmt.Fprintf(&b, "%s  %10s  %6d %s%s\n", red, priceStr(lv.Price), lv.Qty, bar(lv.Qty, maxQty), reset)
 	}
 
 	// Spread / last price band.
-	spread := "   --"
+	spread := "  --"
 	if f.hasBid && f.hasAsk {
-		spread = fmt.Sprintf("%6d", f.bestAsk-f.bestBid)
+		spread = priceStr(f.bestAsk - f.bestBid)
 	}
 	lastStr := "  --"
 	if f.hasLast {
-		lastStr = fmt.Sprintf("%d", f.last)
+		lastStr = priceStr(f.last)
 	}
 	fmt.Fprintf(&b, "  %s--------- last %s%s%s%s  spread %s ---------%s\n", bold, cyan, lastStr, reset, bold, spread, reset)
 
 	// Bids: best (highest) at top down.
 	for _, lv := range f.bids {
-		fmt.Fprintf(&b, "%s  %8d  %6d %s%s\n", green, lv.Price, lv.Qty, bar(lv.Qty, maxQty), reset)
+		fmt.Fprintf(&b, "%s  %10s  %6d %s%s\n", green, priceStr(lv.Price), lv.Qty, bar(lv.Qty, maxQty), reset)
 	}
 
 	fmt.Fprintf(&b, "\n%slatency%s  avg %s  p50 %s  p95 %s  p99 %s  max %s\n",
@@ -285,6 +323,10 @@ func maxLevelQty(a, b []orderbook.PriceLevel) types.Qty {
 		}
 	}
 	return m
+}
+
+func priceStr(p types.Price) string {
+	return fmt.Sprintf("%.2f", float64(p)/priceDiv)
 }
 
 func bar(q, max types.Qty) string {
