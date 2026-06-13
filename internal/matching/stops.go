@@ -14,6 +14,41 @@ type stopOrder struct {
 // PendingStops reports how many stop orders are awaiting their trigger.
 func (e *Engine) PendingStops() int { return len(e.stops) }
 
+// StopView is a read-only view of one pending stop order, for invariant checks
+// and tests.
+type StopView struct {
+	OrderID   types.OrderID
+	Account   types.AccountID
+	Side      types.Side
+	OrdType   types.OrderType
+	Price     types.Price
+	StopPrice types.Price
+	Qty       types.Qty
+	Seq       types.Seq
+}
+
+// StopDump returns every pending stop order in deterministic order (by Seq,
+// then OrderID). The off-book stops hold reservations, so tests/property
+// includes them when checking reserved == open orders (INV-BAL-03), and the
+// dump lets stop semantics (INV-STP-*) be asserted directly.
+func (e *Engine) StopDump() []StopView {
+	out := make([]StopView, 0, len(e.stops))
+	for _, s := range e.stops {
+		o := s.ord
+		out = append(out, StopView{
+			OrderID: o.OrderID, Account: o.Account, Side: o.Side, OrdType: o.OrdType,
+			Price: o.Price, StopPrice: o.StopPrice, Qty: o.Qty, Seq: o.Seq,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Seq != out[j].Seq {
+			return out[i].Seq < out[j].Seq
+		}
+		return out[i].OrderID < out[j].OrderID
+	})
+	return out
+}
+
 func (e *Engine) addStop(o types.FundedOrder) {
 	e.stops = append(e.stops, stopOrder{ord: o})
 }

@@ -92,3 +92,45 @@ func TestSimultaneousStopsActivateInSeqOrder(t *testing.T) {
 		t.Fatalf("activation order by OrderID = [%d %d], want [30 50] (ascending Seq)", sink.cmds[0].OrderID, sink.cmds[1].OrderID)
 	}
 }
+
+// ---- StopDump ----
+
+func TestStopDump_EmptyWhenNoStops(t *testing.T) {
+	e, _ := newEngine()
+	if d := e.StopDump(); len(d) != 0 {
+		t.Fatalf("StopDump on fresh engine = %v, want empty", d)
+	}
+}
+
+func TestStopDump_SingleStop(t *testing.T) {
+	e, _ := newEngine()
+	e.Submit(stop(2, 20, 200, types.Buy, types.Stop, 105, 0, 3)) // far below; stays pending
+	d := e.StopDump()
+	if len(d) != 1 {
+		t.Fatalf("StopDump len = %d, want 1", len(d))
+	}
+	got := d[0]
+	if got.OrderID != 200 || got.Account != 20 || got.Side != types.Buy ||
+		got.OrdType != types.Stop || got.StopPrice != 105 || got.Qty != 3 || got.Seq != 2 {
+		t.Fatalf("StopDump[0] = %+v, fields do not match the submitted stop", got)
+	}
+}
+
+func TestStopDump_SortedBySeqThenID(t *testing.T) {
+	e, _ := newEngine()
+	// Submit out of Seq order; far-from-trigger so all stay pending.
+	e.Submit(stop(5, 20, 50, types.Buy, types.Stop, 500, 0, 1))
+	e.Submit(stop(3, 21, 30, types.Buy, types.Stop, 500, 0, 1))
+	e.Submit(stop(3, 22, 31, types.Buy, types.Stop, 500, 0, 1)) // same Seq, higher ID
+	d := e.StopDump()
+	if len(d) != 3 {
+		t.Fatalf("StopDump len = %d, want 3", len(d))
+	}
+	wantSeq := []types.Seq{3, 3, 5}
+	wantID := []types.OrderID{30, 31, 50}
+	for i := range d {
+		if d[i].Seq != wantSeq[i] || d[i].OrderID != wantID[i] {
+			t.Fatalf("StopDump[%d] = seq %d id %d, want seq %d id %d", i, d[i].Seq, d[i].OrderID, wantSeq[i], wantID[i])
+		}
+	}
+}
