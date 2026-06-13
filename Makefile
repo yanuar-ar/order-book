@@ -1,13 +1,15 @@
-.PHONY: fmt lint vet test race bench build property differential fuzz loadtest loadtest-quick shardbench clean
+.PHONY: fmt lint vet test race bench build property differential fuzz throughput loadtest loadtest-quick clean
 
 # Override on the command line, e.g. `make loadtest TPS=200000 DURATION=1m MARKET=1`.
-TPS ?= 1000000
+TPS ?= 5000000
 DURATION ?= 2m
 USERS ?= 100
 MARKET ?= 0
 LEVELS ?= 15
-# Core assignment for shardbench: ';' separates cores, ',' shares markets on a core.
-# Default: BTC isolated on core 0, ETH+SOL sharing core 1.
+# Engine topology for throughput/loadtest: serial (default) or parallel.
+TOPOLOGY ?= serial
+# Parallel market->worker map: ';' separates workers, ',' shares markets on one.
+# Default: BTC isolated on worker 0, ETH+SOL sharing worker 1.
 CORES ?= 0;1,2
 # Native-fuzz duration for `make fuzz`. Override, e.g. `make fuzz FUZZTIME=5m`.
 FUZZTIME ?= 30s
@@ -51,18 +53,20 @@ differential:
 fuzz:
 	go test ./tests/property/ -run '^$$' -fuzz '^FuzzEngine$$' -fuzztime=$(FUZZTIME)
 
-# Load test with live order-book TUI (defaults: 100k TPS, 2m, 100 users).
+# "How fast can it go": full engine at max rate with offloaded generation.
+# Serial (default) or parallel; for parallel, CORES maps markets->workers.
+# e.g. `make throughput TOPOLOGY=parallel CORES="0;1,2"`.
+throughput:
+	go run ./cmd/throughput -topology $(TOPOLOGY) -cores "$(CORES)" -duration $(DURATION) -users $(USERS)
+
+# "How does it behave at load X": open-loop paced load with a live order-book TUI.
+# e.g. `make loadtest TPS=200000 DURATION=1m MARKET=1 TOPOLOGY=parallel`.
 loadtest:
-	go run ./cmd/loadtest -tps $(TPS) -duration $(DURATION) -users $(USERS) -market $(MARKET) -levels $(LEVELS)
+	go run ./cmd/loadtest -tps $(TPS) -duration $(DURATION) -users $(USERS) -market $(MARKET) -levels $(LEVELS) -topology $(TOPOLOGY) -cores "$(CORES)"
 
 # Short load test for a quick check (10s).
 loadtest-quick:
-	go run ./cmd/loadtest -tps $(TPS) -duration 10s -users $(USERS) -market $(MARKET) -levels $(LEVELS)
-
-# Parallel shard-matching throughput by core assignment.
-# e.g. `make shardbench CORES="0;1;2"` (each market isolated) or `CORES="0;1,2"`.
-shardbench:
-	go run ./cmd/shardbench -cores "$(CORES)" -duration 10s -users $(USERS)
+	go run ./cmd/loadtest -tps $(TPS) -duration 10s -users $(USERS) -market $(MARKET) -levels $(LEVELS) -topology $(TOPOLOGY) -cores "$(CORES)"
 
 clean:
 	rm -rf bin
