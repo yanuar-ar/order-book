@@ -5,8 +5,14 @@
 // (-topology serial|parallel, with -cores for parallel), and run length is
 // either a wall-clock window (-duration) or a fixed, reproducible count
 // (-n + -rngseed, the deterministic latency-regression mode that replaces the
-// old bench). It reports sustained throughput and per-op engine step-latency
-// percentiles as text — no live TUI (see cmd/loadtest for that).
+// old bench).
+//
+// It renders the same live order-book TUI as cmd/loadtest, plus a final summary
+// (throughput, produced/backpressure, engine step-latency percentiles). The
+// frame is built on the engine goroutine between its own Step calls — the sole
+// book mutator in serial topology, and in parallel the workers are idle between
+// the control goroutine's synchronous steps — so the book reads never race the
+// matcher.
 package main
 
 import (
@@ -14,6 +20,7 @@ import (
 	"fmt"
 	"math/rand"
 	"runtime"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -34,6 +41,8 @@ func main() {
 	warmup := flag.Int("warmup", 0, "commands to process before recording latency")
 	rngseed := flag.Int64("rngseed", 1, "producer RNG seed (for -n reproducibility)")
 	users := flag.Int("users", 100, "account pool size")
+	view := flag.Int("market", 0, "market id to display (0=BTC,1=ETH,2=SOL)")
+	levels := flag.Int("levels", 16, "order-book depth levels to show per side")
 	flag.Parse()
 
 	var groups [][]types.MarketID
@@ -62,8 +71,17 @@ func main() {
 
 	startSeq := eng.Seq()
 	total := *warmup + *n
+	title := "spot order-book throughput"
+	sub := subLine(*topology, *n, *warmup, groups)
+	h := harness.NewHist()
+	var framePtr atomic.Pointer[harness.Frame]
 	var stop atomic.Bool
 	var produced, backpressure int64
+
+	displayStop := make(chan struct{})
+	go harness.DisplayLoop(&framePtr, displayStop)
+
+	start := time.Now()
 
 	// Producer: generate base-mid commands as fast as the ingress accepts them.
 	prodDone := make(chan struct{})
@@ -89,12 +107,14 @@ func main() {
 	}()
 
 	// Engine: drain in a tight loop on its own core, owning the histogram (single
-	// writer). Sample per-op step latency 1-in-latSample after warmup.
-	h := harness.NewHist()
+	// writer). Sample per-op step latency 1-in-latSample after warmup, and build a
+	// TUI frame every 100ms (between Steps: safe book read in both topologies).
 	done := make(chan struct{})
 	go func() {
 		_ = platform.PinCurrentThread(len(groups)) // core above the worker range (no-op on non-Linux)
 		defer platform.Unpin()
+		frameEvery := 100 * time.Millisecond
+		nextFrame := start.Add(frameEvery)
 		var processed int64
 		var sampleTick int
 		for !stop.Load() {
@@ -111,11 +131,14 @@ func main() {
 					stop.Store(true)
 				}
 			}
+			if t0.After(nextFrame) {
+				framePtr.Store(harness.BuildFrame(eng, types.MarketID(*view), *levels, h, title, sub, processed, t0.Sub(start), atomic.LoadInt64(&backpressure)))
+				nextFrame = t0.Add(frameEvery)
+			}
 		}
 		close(done)
 	}()
 
-	start := time.Now()
 	if *n == 0 {
 		time.Sleep(*dur)
 		stop.Store(true)
@@ -124,24 +147,27 @@ func main() {
 	<-prodDone
 	elapsed := time.Since(start)
 	eng.Drain()
+	close(displayStop)
+	time.Sleep(120 * time.Millisecond) // let the display goroutine settle
 
-	processed := uint64(eng.Seq() - startSeq)
+	// Engine and producer goroutines have exited; building the final frame on the
+	// main goroutine is race-free.
+	processed := int64(eng.Seq() - startSeq)
+	final := harness.BuildFrame(eng, types.MarketID(*view), *levels, h, title, sub, processed, elapsed, atomic.LoadInt64(&backpressure))
+	harness.Render(final)
+	printSummary(*topology, *n, *warmup, *rngseed, groups, processed, elapsed, atomic.LoadInt64(&produced), atomic.LoadInt64(&backpressure), h)
+}
 
-	fmt.Printf("==== throughput (%s topology) ====\n", *topology)
-	if *topology == "parallel" {
-		fmt.Printf("workers           : %s\n", workerLayout(groups))
+// subLine is the TUI sub-line: topology + run mode + (parallel) the worker map.
+func subLine(topology string, n, warmup int, groups [][]types.MarketID) string {
+	mode := "duration"
+	if n > 0 {
+		mode = fmt.Sprintf("fixed n=%d warmup=%d", n, warmup)
 	}
-	if *n > 0 {
-		fmt.Printf("mode              : fixed count n=%d warmup=%d rngseed=%d (reproducible)\n", *n, *warmup, *rngseed)
-	} else {
-		fmt.Printf("mode              : duration %s\n", elapsed.Round(time.Millisecond))
+	if topology != "parallel" {
+		return "topology serial  " + mode
 	}
-	fmt.Printf("processed         : %d commands\n", processed)
-	fmt.Printf("throughput        : %.0f cmd/s\n", float64(processed)/elapsed.Seconds())
-	fmt.Printf("produced          : %d\n", atomic.LoadInt64(&produced))
-	fmt.Printf("backpressure      : %d (producer waited for the engine)\n", atomic.LoadInt64(&backpressure))
-	fmt.Printf("latency p50/p95/p99/max (engine step): %s / %s / %s / %s\n",
-		harness.Dur(h.Pct(50)), harness.Dur(h.Pct(95)), harness.Dur(h.Pct(99)), harness.Dur(h.Max()))
+	return "topology parallel  " + mode + "  " + workerLayout(groups)
 }
 
 func workerLayout(groups [][]types.MarketID) string {
@@ -151,7 +177,25 @@ func workerLayout(groups [][]types.MarketID) string {
 		for j, m := range g {
 			names[j] = harness.MarketName[m]
 		}
-		parts[i] = fmt.Sprintf("core%d:%v", i, names)
+		parts[i] = fmt.Sprintf("core%d:%s", i, strings.Join(names, "+"))
 	}
-	return fmt.Sprint(parts)
+	return strings.Join(parts, "  ")
+}
+
+func printSummary(topology string, n, warmup int, rngseed int64, groups [][]types.MarketID, processed int64, elapsed time.Duration, produced, backpressure int64, h *harness.Hist) {
+	fmt.Printf("\n==== throughput (%s topology) ====\n", topology)
+	if topology == "parallel" {
+		fmt.Printf("workers           : %s\n", workerLayout(groups))
+	}
+	if n > 0 {
+		fmt.Printf("mode              : fixed count n=%d warmup=%d rngseed=%d (reproducible)\n", n, warmup, rngseed)
+	} else {
+		fmt.Printf("mode              : duration %s\n", elapsed.Round(time.Millisecond))
+	}
+	fmt.Printf("processed         : %d commands\n", processed)
+	fmt.Printf("throughput        : %.0f cmd/s\n", float64(processed)/elapsed.Seconds())
+	fmt.Printf("produced          : %d\n", produced)
+	fmt.Printf("backpressure      : %d (producer waited for the engine)\n", backpressure)
+	fmt.Printf("latency p50/p95/p99/max (engine step): %s / %s / %s / %s\n",
+		harness.Dur(h.Pct(50)), harness.Dur(h.Pct(95)), harness.Dur(h.Pct(99)), harness.Dur(h.Max()))
 }

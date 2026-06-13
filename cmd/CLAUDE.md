@@ -14,7 +14,11 @@ paths; their shared building blocks live in `cmd/internal/harness`.
   generator. `-topology serial|parallel` (+ `-cores` for parallel) makes
   serial-vs-parallel a controlled comparison; run length is `-duration` or
   `-n`+`-rngseed` (the reproducible, deterministic latency-regression mode).
-  Text summary with engine step-latency percentiles, no TUI.
+  Renders the same live order-book TUI as `loadtest` plus a final summary with
+  engine step-latency percentiles. The frame is built **on the engine goroutine**
+  between its own `Step` calls (the sole book mutator in serial; workers idle
+  between the control goroutine's synchronous steps in parallel), so the live
+  book reads never race the matcher.
 - `loadtest` — **"how does it behave at load X"**: open-loop driver with a live
   order-book TUI (bids/asks/depth/last price) and latency stats.
   `-topology serial|parallel` (+ `-cores`). Pacing is open-loop and
