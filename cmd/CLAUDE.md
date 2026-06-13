@@ -17,9 +17,14 @@ in-process. The bench binaries are measurement scaffolds, not production paths.
   last price) and latency stats. Pacing is open-loop and
   **coordinated-omission-correct**: command `i` is scheduled at `start + i/rate`
   and latency is measured from that intended time.
-- `shardbench` — parallel shard-matching throughput by core assignment
-  (`-cores "0;1,2"`). Isolates the parallelizable matching hot path; the balance
-  authority is not exercised here.
+- `shardbench` — **full parallel engine** (`ParallelEngine`) end-to-end
+  throughput by core assignment (`-cores "0;1,2"`), with the same live
+  order-book TUI as `loadtest`. Every command is sequenced, reserved against the
+  shared ledger, and settled; only matching is offloaded to the worker cores. So
+  the reported rate is the honest end-to-end parallel ceiling — bounded by the
+  serial control path (balance authority + per-command worker dispatch), not by
+  matching. Book reads for the live view happen between control steps (workers
+  idle), so they don't race the matchers.
 
 ## Constraints
 
