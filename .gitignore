@@ -1,0 +1,21 @@
+# Binaries
+/bin/
+*.exe
+*.test
+*.out
+
+# Engine runtime artifacts
+*.wal
+/data/
+*.snapshot
+
+# Go
+/vendor/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Claude Code worktrees
+.claude/worktrees/
