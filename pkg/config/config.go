@@ -29,12 +29,53 @@ type Config struct {
 	SnapshotEveryN       int64  // snapshot every N applied commands; 0 disables count-based
 	SnapshotIntervalSecs int64  // snapshot every N seconds; 0 disables time-based
 	SnapshotRetainK      int64  // keep the last K snapshot files; must be >= 1
+
+	// Filters holds the per-market order-validation filters, keyed by the market
+	// symbol (the same strings as Markets). Every market MUST have an entry; the
+	// engine refuses to start otherwise. Values are integer fixed-point at the
+	// configured scales (prices at PriceScale, quantities at QtyScale, notional
+	// at PriceScale, matching types.Notional).
+	Filters map[string]FilterSpec
+}
+
+// FilterSpec is the static, per-market set of CEX-style order filters enforced
+// at submit time. Price and quantity values are fixed-point at PriceScale and
+// QtyScale; notional bounds are quote-currency values at PriceScale (as produced
+// by types.Notional). All values are validated as positive and internally
+// consistent at startup; see Config.Validate.
+type FilterSpec struct {
+	// Price filter (limit and stop trigger/limit prices).
+	TickSize int64 // price increment; price must be a multiple of TickSize
+	MinPrice int64 // minimum price (inclusive)
+	MaxPrice int64 // maximum price (inclusive)
+
+	// Lot filter (limit and stop-limit quantities, plus iceberg total/display).
+	StepSize int64 // quantity increment; qty must be a multiple of StepSize
+	MinQty   int64 // minimum quantity (inclusive)
+	MaxQty   int64 // maximum quantity (inclusive)
+
+	// Market lot filter (market and stop-market quantities). Separate from the
+	// limit lot filter, matching a CEX MARKET_LOT_SIZE.
+	MktStepSize int64 // market-order quantity increment
+	MktMinQty   int64 // minimum market-order quantity (inclusive)
+	MktMaxQty   int64 // maximum market-order quantity (inclusive)
+
+	// Notional filter (quote value = Notional(price, qty)). For market and
+	// stop-market orders the reference price is the market's last-trade price;
+	// when no trade has occurred the notional check is skipped (fail-open).
+	MinNotional int64 // minimum notional (inclusive)
+	MaxNotional int64 // maximum notional (inclusive)
 }
 
 // Default returns the built-in defaults used when no environment is set.
 func Default() Config {
+	markets := []string{"BTC/USDT", "ETH/USDT", "SOL/USDT"}
+	filters := make(map[string]FilterSpec, len(markets))
+	for _, m := range markets {
+		filters[m] = defaultFilter()
+	}
 	return Config{
-		Markets:    []string{"BTC/USDT", "ETH/USDT", "SOL/USDT"},
+		Markets:    markets,
 		RingSize:   1 << 16,
 		WALPath:    "./data/wal",
 		PriceScale: 100_000_000,
@@ -47,6 +88,26 @@ func Default() Config {
 		SnapshotEveryN:       0,    // time-based by default
 		SnapshotIntervalSecs: 3600, // every hour
 		SnapshotRetainK:      3,
+
+		Filters: filters,
+	}
+}
+
+// defaultFilter returns a permissive but well-formed filter at the default
+// 1e8 price/qty scale: 0.01 tick, 0.0001 lot, 10.00 min notional.
+func defaultFilter() FilterSpec {
+	return FilterSpec{
+		TickSize:    1_000_000,             // 0.01
+		MinPrice:    1_000_000,             // 0.01
+		MaxPrice:    100_000_000_000_000,   // 1,000,000.00
+		StepSize:    10_000,                // 0.0001
+		MinQty:      10_000,                // 0.0001
+		MaxQty:      1_000_000_000_000,     // 10,000.0000
+		MktStepSize: 10_000,                // 0.0001
+		MktMinQty:   10_000,                // 0.0001
+		MktMaxQty:   1_000_000_000_000,     // 10,000.0000
+		MinNotional: 1_000_000_000,         // 10.00
+		MaxNotional: 1_000_000_000_000_000, // 10,000,000.00
 	}
 }
 
@@ -96,10 +157,73 @@ func Load(getenv func(string) string) (Config, error) {
 		return Config{}, err
 	}
 
+	// Per-market filters. Each field falls back to the default-market filter when
+	// present, so the default markets work with no extra env; a market introduced
+	// via OB_MARKETS must supply its own filter values or Validate rejects it.
+	filters := make(map[string]FilterSpec, len(c.Markets))
+	for _, m := range c.Markets {
+		f := c.Filters[m] // zero FilterSpec when m is not a default market
+		if f, err = loadFilter(getenv, m, f); err != nil {
+			return Config{}, err
+		}
+		filters[m] = f
+	}
+	c.Filters = filters
+
 	if err := c.Validate(); err != nil {
 		return Config{}, err
 	}
 	return c, nil
+}
+
+// loadFilter resolves one market's filter from env keys of the form
+// OB_FILTER_<SYMBOL>_<FIELD> (symbol uppercased with "/" and "-" mapped to "_"),
+// each falling back to the corresponding field of def.
+func loadFilter(getenv func(string) string, market string, def FilterSpec) (FilterSpec, error) {
+	field := func(name string, d int64) (int64, error) {
+		return envInt(getenv, filterEnvKey(market, name), d)
+	}
+	f := def
+	var err error
+	if f.TickSize, err = field("TICK_SIZE", def.TickSize); err != nil {
+		return f, err
+	}
+	if f.MinPrice, err = field("MIN_PRICE", def.MinPrice); err != nil {
+		return f, err
+	}
+	if f.MaxPrice, err = field("MAX_PRICE", def.MaxPrice); err != nil {
+		return f, err
+	}
+	if f.StepSize, err = field("STEP_SIZE", def.StepSize); err != nil {
+		return f, err
+	}
+	if f.MinQty, err = field("MIN_QTY", def.MinQty); err != nil {
+		return f, err
+	}
+	if f.MaxQty, err = field("MAX_QTY", def.MaxQty); err != nil {
+		return f, err
+	}
+	if f.MktStepSize, err = field("MKT_STEP_SIZE", def.MktStepSize); err != nil {
+		return f, err
+	}
+	if f.MktMinQty, err = field("MKT_MIN_QTY", def.MktMinQty); err != nil {
+		return f, err
+	}
+	if f.MktMaxQty, err = field("MKT_MAX_QTY", def.MktMaxQty); err != nil {
+		return f, err
+	}
+	if f.MinNotional, err = field("MIN_NOTIONAL", def.MinNotional); err != nil {
+		return f, err
+	}
+	if f.MaxNotional, err = field("MAX_NOTIONAL", def.MaxNotional); err != nil {
+		return f, err
+	}
+	return f, nil
+}
+
+func filterEnvKey(market, field string) string {
+	sym := strings.NewReplacer("/", "_", "-", "_").Replace(strings.ToUpper(market))
+	return "OB_FILTER_" + sym + "_" + field
 }
 
 // LoadFromOS loads configuration from the process environment.
@@ -138,6 +262,45 @@ func (c Config) Validate() error {
 	}
 	if c.SnapshotRetainK < 1 {
 		return fmt.Errorf("config: OB_SNAPSHOT_RETAIN must be >= 1, got %d", c.SnapshotRetainK)
+	}
+	for _, m := range c.Markets {
+		f, ok := c.Filters[m]
+		if !ok {
+			return fmt.Errorf("config: market %q missing filter spec", m)
+		}
+		if err := f.validate(m); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validate checks that a filter is well-formed: positive increments and bounds,
+// ordered ranges, and minimums aligned to their increment.
+func (f FilterSpec) validate(market string) error {
+	if f.TickSize <= 0 || f.StepSize <= 0 || f.MktStepSize <= 0 {
+		return fmt.Errorf("config: market %q filter increments must be positive (tick=%d step=%d mktStep=%d)", market, f.TickSize, f.StepSize, f.MktStepSize)
+	}
+	if f.MinPrice <= 0 || f.MinPrice > f.MaxPrice {
+		return fmt.Errorf("config: market %q price bounds invalid (min=%d max=%d)", market, f.MinPrice, f.MaxPrice)
+	}
+	if f.MinQty <= 0 || f.MinQty > f.MaxQty {
+		return fmt.Errorf("config: market %q lot bounds invalid (min=%d max=%d)", market, f.MinQty, f.MaxQty)
+	}
+	if f.MktMinQty <= 0 || f.MktMinQty > f.MktMaxQty {
+		return fmt.Errorf("config: market %q market-lot bounds invalid (min=%d max=%d)", market, f.MktMinQty, f.MktMaxQty)
+	}
+	if f.MinNotional < 0 || f.MaxNotional <= 0 || f.MinNotional > f.MaxNotional {
+		return fmt.Errorf("config: market %q notional bounds invalid (min=%d max=%d)", market, f.MinNotional, f.MaxNotional)
+	}
+	if f.MinPrice%f.TickSize != 0 {
+		return fmt.Errorf("config: market %q MinPrice %d not aligned to TickSize %d", market, f.MinPrice, f.TickSize)
+	}
+	if f.MinQty%f.StepSize != 0 {
+		return fmt.Errorf("config: market %q MinQty %d not aligned to StepSize %d", market, f.MinQty, f.StepSize)
+	}
+	if f.MktMinQty%f.MktStepSize != 0 {
+		return fmt.Errorf("config: market %q MktMinQty %d not aligned to MktStepSize %d", market, f.MktMinQty, f.MktStepSize)
 	}
 	return nil
 }
