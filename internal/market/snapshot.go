@@ -101,6 +101,30 @@ func Restore(cfg Config, path string) (*Engine, error) {
 	return e, nil
 }
 
+// StateFingerprint returns a deterministic byte fingerprint of the engine's
+// complete resumable state: the ledger (balances, fees, and per-order
+// reservations), the open-order map (incl. qty and ordType), the books (incl.
+// iceberg peak/hidden and lastPrice), and the stop table. It covers exactly the
+// components the canonical book+ledger digest omits, so two engines whose
+// fingerprints AND Seq match are state-identical down to the per-order money
+// fields. INV-DET-02 compares fingerprints so it cannot pass while a real
+// restart would diverge. The header (config/version) and Seq are excluded —
+// callers compare Seq separately.
+func (e *Engine) StateFingerprint() []byte {
+	parts := [][]byte{
+		e.core.ledger.EncodeSnapshot(),
+		encodeOpenMap(e.core.open),
+		e.encodeBooks(),
+		e.encodeStops(),
+	}
+	var out []byte
+	for _, p := range parts {
+		out = openU32(out, uint32(len(p)))
+		out = append(out, p...)
+	}
+	return out
+}
+
 // encodeHeader serializes the format version, the money-scale config the ledger
 // integers were computed under, and the market→asset layout. Restore rejects any
 // mismatch: the serialized balances are integers under the snapshot-time scales,
