@@ -11,6 +11,12 @@ sequencer, balance authority, and shards together. Provides both the serial
 - `engine.go` — `Core` (implements `sequencer.Router`): reserves funds, routes
   funded orders to shards, settles fills inline, manages reservation lifecycle.
   Serial v1: the sequencer's routing thread matches and settles inline.
+  `Engine.Acks()` is **gated on the durable watermark**: it returns only acks at
+  or below `DurableSeq()` (the durable-ack barrier — acks above it are
+  speculative). After `Drain` the watermark equals `Seq`, so every ack releases
+  and drain-then-read callers are unaffected. `Fatal()`/`DurableSeq()` expose the
+  sequencer's barrier state; `ParallelEngine.Acks()` gates identically via the
+  shared `releasedAcks` helper and shared sequencer.
 - `parallel.go` — `ParallelEngine`: offloads matching to per-worker goroutines
   (configurable market→worker assignment) while keeping sequencing and the
   balance authority single-writer. Control drives ops in strict `Seq` order,
@@ -25,7 +31,10 @@ sequencer, balance authority, and shards together. Provides both the serial
   lastPrice) used by INV-DET-02. Also the open-map codec.
 - `snapshotter.go` — `Snapshotter`: count- and/or time-triggered snapshots (one
   goroutine, quiesced boundary), files named by `Seq`, retention of the last K
-  (WAL never GC'd), and `LatestSnapshot` for recovery.
+  (WAL never GC'd), and `LatestSnapshot` for recovery. The drain before publish
+  flushes the WAL, so a published snapshot's `Seq` is always `<= durableSeq`; a
+  fail-stop during that drain aborts publication (checks `Fatal()` after `Drain`)
+  rather than persisting state the WAL cannot back.
 - `recover.go` — `Recover`: load latest snapshot + replay WAL tail, falling back
   to full replay from `Seq` 0 (logged) on a missing/corrupt/incompatible
   snapshot; primes the sequencer to the final journaled `Seq` for live resume.
