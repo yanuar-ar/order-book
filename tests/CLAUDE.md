@@ -57,7 +57,10 @@ money-safety guarantee is enforced — read
 - **Recovery** — full WAL replay equivalence (INV-DET-01), multi-segment
   rollover, torn-tail clean stop (INV-DET-03), metamorphic cancel-all /
   batch-invariance (INV-MET-01/02/04). Mid-stream snapshot equivalence
-  (INV-DET-02) is deferred — needs an engine snapshot/restore API.
+  (INV-DET-02) — `snapshot_test.go`: (restore@S + replay (S,N]) == full replay
+  [0,N] over the complete state fingerprint, plus `FuzzSnapshotEquivalence`.
+  `recover_test.go` covers snapshot+tail recovery and the corrupt-snapshot
+  fallback (AE4).
 - **Adversarial seeds** (guide §6) — `adversarial_test.go` has an explicit
   scenario per row (exact-fit / one-short / joint-over balance, cross-market
   double-spend, int64-max overflow, FOK one-short rollback, post-only exact-touch,

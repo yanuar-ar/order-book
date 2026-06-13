@@ -15,6 +15,10 @@ account. This is the most money-critical package in the engine.
   consumes so reservations (in `Seq` order) and settlements (in fill order)
   interleave in one fixed, deterministic order.
 - `dump.go` — deterministic ledger dump for snapshots / invariant checks.
+- `snapshot.go` — `EncodeSnapshot` / `Restore`: serialize `bal`+`fees`+`res` and
+  rebuild directly. Reservations are serialized **verbatim by key-set** (incl.
+  `remaining == 0`, or a settled-but-unreleased order is orphaned); restore sets
+  the maps without `Reserve` and reads amounts as opaque int64s (no re-rounding).
 - `ledger_test.go`, `ledger_bench_test.go`.
 
 ## Constraints

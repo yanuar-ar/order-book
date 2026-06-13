@@ -6,7 +6,10 @@ touched on the hot path.
 ## config
 
 `config.go` — `Config` (markets, ring size, WAL path, fixed-point scales, fee
-rates) loaded from environment variables, read **once at startup**. No
+rates, and snapshot cadence/retention/path) loaded from environment variables,
+read **once at startup**. Snapshot keys: `OB_SNAPSHOT_PATH` (must differ from
+`OB_WAL_PATH`), `OB_SNAPSHOT_EVERY` (count) / `OB_SNAPSHOT_INTERVAL` (seconds;
+at least one > 0), `OB_SNAPSHOT_RETAIN` (>= 1). No
 third-party dependencies. `Default()` supplies built-in defaults; `Load(getenv)`
 takes an injected `getenv` (tests pass a deterministic map; production uses
 `LoadFromOS`). It **validates** before returning. See `.env.example`.
