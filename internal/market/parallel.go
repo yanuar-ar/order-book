@@ -40,6 +40,7 @@ const (
 	reqSubmit uint8 = iota
 	reqCancel
 	reqAmend
+	reqLastPrice
 )
 
 type wreq struct {
@@ -53,6 +54,7 @@ type wreq struct {
 type wresp struct {
 	result matching.Result
 	ok     bool
+	price  types.Price // reqLastPrice result
 	acts   []types.Command
 }
 
@@ -107,6 +109,8 @@ func (w *worker) run(coreIdx int) {
 			resp.ok = sh.Cancel(req.id)
 		case reqAmend:
 			resp.ok = sh.AmendDown(req.id, req.qty)
+		case reqLastPrice:
+			resp.price, resp.ok = sh.LastPrice()
 		}
 		for !w.resps.Push(resp) {
 			// resp ring is sized so this never blocks in practice (control has
@@ -146,6 +150,10 @@ func (r *remoteShard) Cancel(id types.OrderID) bool {
 }
 func (r *remoteShard) AmendDown(id types.OrderID, qty types.Qty) bool {
 	return r.call(wreq{kind: reqAmend, market: r.market, id: id, qty: qty}).ok
+}
+func (r *remoteShard) LastPrice() (types.Price, bool) {
+	resp := r.call(wreq{kind: reqLastPrice, market: r.market})
+	return resp.price, resp.ok
 }
 
 // NewParallelEngine builds the engine with matching offloaded to workers per
@@ -196,7 +204,7 @@ func NewParallelEngine(cfg Config, groups [][]types.MarketID) *ParallelEngine {
 		pe.workers = append(pe.workers, &worker{reqs: reqs, resps: resps, shards: wshards, coll: coll, stop: &pe.stop})
 	}
 
-	pe.core = &Core{shards: coreShards, ledger: ledger, open: make(map[types.OrderID]openOrder, 1024)}
+	pe.core = &Core{shards: coreShards, ledger: ledger, open: make(map[types.OrderID]openOrder, 1024), filters: cfg.Filters, qtyScale: cfg.QtyScale}
 	pe.seq = sequencer.New(sequencer.Config{
 		Reinject: reinject,
 		Inputs:   []*spsc.RingCommand{ingress},
@@ -234,6 +242,9 @@ func (pe *ParallelEngine) Ledger() *balance.Ledger { return pe.core.ledger }
 // Shard returns a market's shard. Read its book only after Drain (control
 // quiesced) or Close (workers stopped) to avoid racing the worker.
 func (pe *ParallelEngine) Shard(m types.MarketID) *Shard { return pe.impls[m] }
+
+// Filters returns the per-market order filters (read access for invariants).
+func (pe *ParallelEngine) Filters() map[types.MarketID]types.MarketFilters { return pe.core.filters }
 
 // Acks returns captured acks.
 func (pe *ParallelEngine) Acks() []types.Ack { return pe.core.acks }

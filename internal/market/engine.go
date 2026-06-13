@@ -30,15 +30,18 @@ type shardOps interface {
 	Submit(types.FundedOrder) matching.Result
 	Cancel(types.OrderID) bool
 	AmendDown(types.OrderID, types.Qty) bool
+	LastPrice() (types.Price, bool)
 }
 
 // Core implements sequencer.Router: it reserves funds, routes funded orders to
 // shards, settles fills inline, and manages the reservation lifecycle.
 type Core struct {
-	shards map[types.MarketID]shardOps
-	ledger *balance.Ledger
-	open   map[types.OrderID]openOrder
-	acks   []types.Ack // captured for tests/publisher
+	shards   map[types.MarketID]shardOps
+	ledger   *balance.Ledger
+	open     map[types.OrderID]openOrder
+	acks     []types.Ack // captured for tests/publisher
+	filters  map[types.MarketID]types.MarketFilters
+	qtyScale int64
 }
 
 // OnSettlement is unused in single-threaded mode (fills settle inline in
@@ -80,6 +83,17 @@ func (c *Core) newOrder(cmd types.Command) {
 	_, isActivation := c.open[cmd.OrderID]
 
 	if !isActivation {
+		// Validate static order filters before any reservation or book mutation,
+		// so a rejected order leaves zero state change. Stop activations re-enter
+		// here with isActivation true and are not re-validated (validated once at
+		// submit). Markets without a configured filter set skip validation.
+		if f, ok := c.filters[cmd.Market]; ok {
+			last, hasLast := c.shards[cmd.Market].LastPrice()
+			if reason := f.ValidateNew(funded, c.qtyScale, last, hasLast); reason != types.ReasonNone {
+				c.ack(cmd, types.AckRejected, reason)
+				return
+			}
+		}
 		// A market buy bounds its spend to the reservable quote budget.
 		if funded.OrdType == types.Market && funded.Side == types.Buy {
 			funded.MaxQuote = c.ledger.MarketBuyBudget(funded.Account, funded.Market)
@@ -154,6 +168,15 @@ func (c *Core) amend(cmd types.Command) {
 	sh := c.shards[oo.market]
 	// Quantity decrease at the same price: amend in place, keep time priority.
 	if cmd.Price == oo.price && cmd.Qty < oo.qty {
+		// Re-validate the reduced quantity so an amend can't leave a resting order
+		// off-lot or below the notional floor. Price is unchanged. On reject the
+		// order keeps its prior quantity.
+		if f, ok := c.filters[oo.market]; ok {
+			if reason := f.ValidateAmendDown(oo.price, cmd.Qty, c.qtyScale); reason != types.ReasonNone {
+				c.ack(cmd, types.AckRejected, reason)
+				return
+			}
+		}
 		if sh.AmendDown(cmd.OrderID, cmd.Qty) {
 			c.ledger.AmendReduce(cmd.OrderID, oo.side, oo.price, cmd.Qty)
 			oo.qty = cmd.Qty
@@ -196,6 +219,7 @@ type Engine struct {
 // Config wires an engine.
 type Config struct {
 	Markets  map[types.MarketID]balance.MarketSpec
+	Filters  map[types.MarketID]types.MarketFilters
 	QtyScale int64
 	FeeScale int64
 	MakerFee int64
@@ -245,7 +269,7 @@ func NewEngine(cfg Config) *Engine {
 		impls[m] = s
 		shards[m] = s
 	}
-	core := &Core{shards: shards, ledger: ledger, open: make(map[types.OrderID]openOrder, 1024)}
+	core := &Core{shards: shards, ledger: ledger, open: make(map[types.OrderID]openOrder, 1024), filters: cfg.Filters, qtyScale: cfg.QtyScale}
 
 	ingress := spsc.NewCommand(cfg.RingSize)
 	reinject := spsc.NewCommand(cfg.RingSize)
@@ -303,6 +327,9 @@ func (e *Engine) Ledger() *balance.Ledger { return e.core.ledger }
 
 // Shard returns the shard for a market.
 func (e *Engine) Shard(m types.MarketID) *Shard { return e.impls[m] }
+
+// Filters returns the per-market order filters (read access for invariants).
+func (e *Engine) Filters() map[types.MarketID]types.MarketFilters { return e.core.filters }
 
 // MarketIDs returns the engine's market IDs in ascending order.
 func (e *Engine) MarketIDs() []types.MarketID {

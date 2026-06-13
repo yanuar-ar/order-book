@@ -41,6 +41,7 @@ func main() {
 
 	mcfg := market.Config{
 		Markets:  specs,
+		Filters:  buildMarketFilters(cfg),
 		QtyScale: cfg.QtyScale,
 		FeeScale: cfg.FeeScale,
 		MakerFee: cfg.MakerFee,
@@ -133,4 +134,28 @@ func buildMarketSpecs(markets []string) (map[types.MarketID]balance.MarketSpec, 
 		specs[types.MarketID(i)] = balance.MarketSpec{Base: assetID(parts[0]), Quote: assetID(parts[1])}
 	}
 	return specs, assets
+}
+
+// buildMarketFilters maps each market (in config order, matching buildMarketSpecs)
+// to its engine-internal filter set. Config.Validate has already guaranteed every
+// market has a complete, consistent filter entry.
+func buildMarketFilters(cfg config.Config) map[types.MarketID]types.MarketFilters {
+	out := make(map[types.MarketID]types.MarketFilters, len(cfg.Markets))
+	for i, m := range cfg.Markets {
+		f := cfg.Filters[m]
+		out[types.MarketID(i)] = types.MarketFilters{
+			TickSize:    f.TickSize,
+			MinPrice:    f.MinPrice,
+			MaxPrice:    f.MaxPrice,
+			StepSize:    f.StepSize,
+			MinQty:      f.MinQty,
+			MaxQty:      f.MaxQty,
+			MktStepSize: f.MktStepSize,
+			MktMinQty:   f.MktMinQty,
+			MktMaxQty:   f.MktMaxQty,
+			MinNotional: f.MinNotional,
+			MaxNotional: f.MaxNotional,
+		}
+	}
+	return out
 }

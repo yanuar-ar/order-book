@@ -50,6 +50,14 @@ func (m *Model) newOrder(o order) {
 	_, isActivation := m.open[o.id]
 
 	if !isActivation {
+		// Mirror Core.newOrder: validate filters before reserve. Activations are
+		// not re-validated. Markets without a filter set skip validation.
+		if f, ok := m.cfg.Filters[o.market]; ok {
+			last, hasLast := m.last[o.market]
+			if f.ValidateNew(o.funded(), m.cfg.QtyScale, last, hasLast) != types.ReasonNone {
+				return
+			}
+		}
 		if o.ordType == types.Market && o.side == types.Buy {
 			o.maxQuote = m.marketBuyBudget(o.acct, o.market)
 		}
@@ -107,6 +115,12 @@ func (m *Model) amend(c types.Command) {
 		return
 	}
 	if c.Price == oo.price && c.Qty < oo.qty {
+		// Mirror Core.amend: re-validate the reduced quantity before applying.
+		if f, ok := m.cfg.Filters[oo.market]; ok {
+			if f.ValidateAmendDown(oo.price, c.Qty, m.cfg.QtyScale) != types.ReasonNone {
+				return
+			}
+		}
 		if m.amendDownBook(oo.market, c.OrderID, c.Qty) {
 			m.amendReduce(c.OrderID, oo.side, oo.price, c.Qty)
 			oo.qty = c.Qty

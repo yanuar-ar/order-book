@@ -25,6 +25,9 @@ type Config struct {
 	MakerFee int64
 	TakerFee int64
 	Markets  map[types.MarketID]MarketSpec
+	// Filters mirrors market.Config.Filters: per-market order filters validated at
+	// submit. A market with no entry skips validation (same as the engine).
+	Filters map[types.MarketID]types.MarketFilters
 }
 
 type acctKey struct {
@@ -87,6 +90,16 @@ type order struct {
 	qty        types.Qty
 	displayQty types.Qty
 	maxQuote   int64
+}
+
+// funded renders the model's internal order as a types.FundedOrder, so filter
+// validation runs through the exact same code path as the engine.
+func (o order) funded() types.FundedOrder {
+	return types.FundedOrder{
+		Seq: o.seq, Market: o.market, Account: o.acct, OrderID: o.id,
+		Side: o.side, OrdType: o.ordType, Tif: o.tif, Flags: o.flags,
+		Price: o.price, StopPrice: o.stopPrice, Qty: o.qty, DisplayQty: o.displayQty,
+	}
 }
 
 func orderFrom(c types.Command) order {

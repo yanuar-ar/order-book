@@ -171,4 +171,9 @@ const (
 	ReasonFOKUnfillable
 	ReasonUnknownOrder
 	ReasonOverflow
+	// Filter rejections (per filter group; see MarketFilters).
+	ReasonPriceFilter   // off-tick or out-of-range price
+	ReasonLotSize       // off-step or out-of-range limit/iceberg quantity
+	ReasonMarketLotSize // off-step or out-of-range market-order quantity
+	ReasonNotional      // notional (price*qty) out of range
 )

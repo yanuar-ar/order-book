@@ -28,12 +28,33 @@ var (
 	genBases   = []types.AssetID{1, 3, 4}
 )
 
+// genFilters is the single source of per-market filters for the differential
+// harness. Both engineCfg and modelCfg derive from it so the engine and the
+// reference model can never drift. It is deliberately tuned against the
+// generated price/qty bands (prices 90..110, qty 1..20): tick and price range
+// are permissive (every integer price is on-tick and in range, preserving
+// matching coverage), while MinQty/MinNotional/market-lot reject a meaningful
+// slice of generated orders so the rejection paths fire under fuzzing.
+func genFilters() map[types.MarketID]types.MarketFilters {
+	f := types.MarketFilters{
+		TickSize: 1, MinPrice: 1, MaxPrice: 1000,
+		StepSize: 1, MinQty: 2, MaxQty: 1000,
+		MktStepSize: 1, MktMinQty: 2, MktMaxQty: 1000,
+		MinNotional: 200, MaxNotional: 10_000_000,
+	}
+	out := map[types.MarketID]types.MarketFilters{}
+	for _, m := range genMarkets {
+		out[m] = f
+	}
+	return out
+}
+
 func engineCfg() market.Config {
 	specs := map[types.MarketID]balance.MarketSpec{}
 	for i, m := range genMarkets {
 		specs[m] = balance.MarketSpec{Base: genBases[i], Quote: genQuote}
 	}
-	return market.Config{Markets: specs, QtyScale: genQtyScale, FeeScale: genFeeScale, MakerFee: genMakerFee, TakerFee: genTakerFee, RingSize: 1 << 14, CapHint: 4096}
+	return market.Config{Markets: specs, Filters: genFilters(), QtyScale: genQtyScale, FeeScale: genFeeScale, MakerFee: genMakerFee, TakerFee: genTakerFee, RingSize: 1 << 14, CapHint: 4096}
 }
 
 func modelCfg() refmodel.Config {
@@ -41,7 +62,7 @@ func modelCfg() refmodel.Config {
 	for i, m := range genMarkets {
 		specs[m] = refmodel.MarketSpec{Base: genBases[i], Quote: genQuote}
 	}
-	return refmodel.Config{Markets: specs, QtyScale: genQtyScale, FeeScale: genFeeScale, MakerFee: genMakerFee, TakerFee: genTakerFee}
+	return refmodel.Config{Markets: specs, Filters: genFilters(), QtyScale: genQtyScale, FeeScale: genFeeScale, MakerFee: genMakerFee, TakerFee: genTakerFee}
 }
 
 // Stream is a deterministic deposit prelude plus an order stream, with the net
@@ -142,10 +163,29 @@ func genStream(seed int64, n int, sharp bool) Stream {
 				Side: types.Side(r.Intn(2)), Price: randPrice(), Qty: randQty(),
 			}
 			applyType(&c, r, sharp, randPrice)
+			injectOffGrid(&c, r)
 			orders = append(orders, c)
 		}
 	}
 	return Stream{Deposits: deposits, Orders: orders, NetDeposits: net}
+}
+
+// injectOffGrid occasionally pushes an order off its market's filter grid
+// (above MaxPrice, above MaxQty, or below MinQty against genFilters) so the
+// price-range and max-bound rejection paths fire under the differential and
+// fuzz harness. The engine and reference model reject these identically.
+func injectOffGrid(c *types.Command, r *rand.Rand) {
+	if r.Intn(100) >= 4 {
+		return
+	}
+	switch r.Intn(3) {
+	case 0:
+		c.Price = types.Price(1001 + r.Intn(100)) // above MaxPrice (limit/stop-limit)
+	case 1:
+		c.Qty = types.Qty(1001 + r.Intn(100)) // above MaxQty / MktMaxQty
+	default:
+		c.Qty = 1 // below MinQty / MktMinQty
+	}
 }
 
 // applyType selects an order type/TIF/flags for a new-order command, weighted to

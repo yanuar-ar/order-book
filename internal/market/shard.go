@@ -45,6 +45,10 @@ func (s *Shard) AmendDown(id types.OrderID, newQty types.Qty) bool {
 // Book exposes the shard's book (read access for invariants/tests).
 func (s *Shard) Book() *orderbook.Book { return s.engine.Book() }
 
+// LastPrice returns the market's last-trade price (and whether one exists). Used
+// as the reference for market-order notional validation.
+func (s *Shard) LastPrice() (types.Price, bool) { return s.engine.Book().LastPrice() }
+
 // StopDump exposes the shard's pending stop orders (read access for
 // invariants/tests).
 func (s *Shard) StopDump() []matching.StopView { return s.engine.StopDump() }

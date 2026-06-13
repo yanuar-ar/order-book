@@ -18,6 +18,7 @@ type Inspectable interface {
 	Ledger() *balance.Ledger
 	Shard(types.MarketID) *market.Shard
 	MarketIDs() []types.MarketID
+	Filters() map[types.MarketID]types.MarketFilters
 }
 
 // CheckAllInvariants runs the applicable invariant taxonomy (testing guide §3)
@@ -80,10 +81,19 @@ func CheckAllInvariants(e Inspectable, netDeposits map[types.AssetID]int64) erro
 	for _, id := range led.ReservedOrders() {
 		reserved[id] = true
 	}
+	// INV-ARI-07: every resting order is on its market's price/lot grid. Minimums
+	// are not asserted — a partial fill can leave a remainder below MinQty.
+	filters := e.Filters()
 	open := map[types.OrderID]bool{}
 	for _, m := range e.MarketIDs() {
+		f, hasFilter := filters[m]
 		for _, o := range e.Shard(m).Book().Dump() {
 			open[o.ID] = true
+			if hasFilter {
+				if v := f.RestingViolation(o.Price, o.Remaining, o.Display); v != "" {
+					return fmt.Errorf("INV-ARI-07: market %d order %d resting off-grid: %s (price %d remaining %d display %d)", m, o.ID, v, o.Price, o.Remaining, o.Display)
+				}
+			}
 		}
 		for _, s := range e.Shard(m).StopDump() {
 			open[s.OrderID] = true
