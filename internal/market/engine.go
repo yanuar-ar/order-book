@@ -83,6 +83,17 @@ func (c *Core) newOrder(cmd types.Command) {
 	_, isActivation := c.open[cmd.OrderID]
 
 	if !isActivation {
+		// Validate static order filters before any reservation or book mutation,
+		// so a rejected order leaves zero state change. Stop activations re-enter
+		// here with isActivation true and are not re-validated (validated once at
+		// submit). Markets without a configured filter set skip validation.
+		if f, ok := c.filters[cmd.Market]; ok {
+			last, hasLast := c.shards[cmd.Market].LastPrice()
+			if reason := f.ValidateNew(funded, c.qtyScale, last, hasLast); reason != types.ReasonNone {
+				c.ack(cmd, types.AckRejected, reason)
+				return
+			}
+		}
 		// A market buy bounds its spend to the reservable quote budget.
 		if funded.OrdType == types.Market && funded.Side == types.Buy {
 			funded.MaxQuote = c.ledger.MarketBuyBudget(funded.Account, funded.Market)
