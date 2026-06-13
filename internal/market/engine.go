@@ -1,7 +1,10 @@
 package market
 
 import (
+	"sort"
+
 	"github.com/yanuar-ar/order-book/internal/balance"
+	"github.com/yanuar-ar/order-book/internal/matching"
 	"github.com/yanuar-ar/order-book/internal/sequencer"
 	"github.com/yanuar-ar/order-book/internal/spsc"
 	"github.com/yanuar-ar/order-book/internal/types"
@@ -74,6 +77,13 @@ func (c *Core) newOrder(cmd types.Command) {
 	}
 
 	sh := c.shards[cmd.Market]
+	if isActivation {
+		// Remove the now-activated stop from the shard's pending table. In live
+		// mode triggerStops already popped it (no-op here); in replay mode stops
+		// are suppressed, so this clears the stale pending entry — keeping live
+		// and replayed state identical.
+		sh.Cancel(cmd.OrderID)
+	}
 	res := sh.Submit(funded)
 
 	if res.Pending { // stop / stop-limit stored, reservation held
@@ -174,11 +184,18 @@ type Config struct {
 	Journal  sequencer.Journal   // nil -> no-op (in-memory) journal
 	Clock    sequencer.ClockFunc // nil -> deterministic counter
 	CapHint  int
+	// SuppressStops installs a no-op activation sink. Set during replay, where
+	// stop activations are read from the WAL rather than regenerated.
+	SuppressStops bool
 }
 
 type noopJournal struct{}
 
 func (noopJournal) Append(wal.Record) error { return nil }
+
+type noopSink struct{}
+
+func (noopSink) Emit(types.Command) {}
 
 func counterClock() sequencer.ClockFunc {
 	var n int64
@@ -219,10 +236,26 @@ func NewEngine(cfg Config) *Engine {
 		Router:   core,
 		Clock:    cfg.Clock,
 	})
+	var sink matching.Sink = reinjectSink{seq: seq}
+	if cfg.SuppressStops {
+		sink = noopSink{}
+	}
 	for _, sh := range shards {
-		sh.SetSink(reinjectSink{seq: seq})
+		sh.SetSink(sink)
 	}
 	return &Engine{seq: seq, core: core, ingress: ingress}
+}
+
+// ApplyJournaled applies a command read from the WAL directly to the core,
+// preserving its original Seq and bypassing re-sequencing. Used by replay.
+func (e *Engine) ApplyJournaled(cmd types.Command) { e.core.OnCommand(cmd) }
+
+// EnableStops re-installs the live stop-activation sink, used after a replay
+// (which ran with stops suppressed) to resume normal operation.
+func (e *Engine) EnableStops() {
+	for _, sh := range e.core.shards {
+		sh.SetSink(reinjectSink{seq: e.seq})
+	}
 }
 
 // Submit pushes a command onto the ingress ring. Returns false if full.
@@ -242,6 +275,16 @@ func (e *Engine) Ledger() *balance.Ledger { return e.core.ledger }
 
 // Shard returns the shard for a market.
 func (e *Engine) Shard(m types.MarketID) *Shard { return e.core.shards[m] }
+
+// MarketIDs returns the engine's market IDs in ascending order.
+func (e *Engine) MarketIDs() []types.MarketID {
+	ids := make([]types.MarketID, 0, len(e.core.shards))
+	for m := range e.core.shards {
+		ids = append(ids, m)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
+}
 
 // Acks returns the acks captured so far.
 func (e *Engine) Acks() []types.Ack { return e.core.acks }
