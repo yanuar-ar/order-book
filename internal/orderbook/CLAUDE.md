@@ -11,6 +11,11 @@ lists per price level**. Cancelled slots recycle through a free-list.
 - `consume.go` — quantity consumption / fill application against levels.
 - `match_support.go` — helpers the matcher calls into (best price, level walk).
 - `dump.go` — deterministic state dump for snapshots/invariant checks.
+- `snapshot.go` — `EncodeSnapshot` / `RestoreSnapshot` and `InsertRestored`.
+  Carries all four quantity fields (`remaining`/`display`/`hidden`/`peak`) plus
+  `lastPrice`: a mid-refill iceberg cannot round-trip through `Insert` (which
+  derives `peak = display`), so restore sets the fields directly. Re-resting in
+  `Dump` (FIFO) order reproduces time priority.
 
 `NilIdx (0xFFFFFFFF)` marks an absent slot (list terminator / empty level).
 

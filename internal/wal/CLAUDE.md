@@ -23,8 +23,10 @@ Clustering/failover and backup/DR are out of scope for v1.
 
 `wal_test.go` exists. Cover:
 - **Positive**: append → replay reproduces records exactly; segment rollover at
-  the size boundary; `load snapshot@S + replay (S,N] == replay [0,N]`
-  (`INV-DET-02`).
+  the size boundary; snapshot container round-trip (`WriteSnapshot`/`ReadSnapshot`
+  CRC + sections). The full `load snapshot@S + replay (S,N] == replay [0,N]`
+  equivalence (`INV-DET-02`) is asserted at the engine level — it needs the engine
+  snapshot/restore API — in `tests/property/snapshot_test.go`.
 - **Negative/edge**: **torn-tail** (truncated final record) — recovery
   truncates cleanly and the rebuilt state still satisfies all A–E invariants
   (`INV-DET-03`); empty dir; multi-segment replay ordering.

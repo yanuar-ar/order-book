@@ -120,7 +120,8 @@ state-machine layer, so it never links into `go build ./cmd/engine`.
 ## Layout
 
 ```
-cmd/engine       # in-process engine wiring (v1 has no network gateway)
+cmd/engine       # in-process engine wiring: startup recovery, snapshot cadence,
+                 #   graceful shutdown (v1 has no network gateway)
 cmd/bench        # single-thread latency/throughput harness
 cmd/enginebench  # honest serial-engine throughput ceiling (offloaded generation)
 cmd/loadtest     # open-loop load driver with a live order-book TUI
@@ -132,7 +133,8 @@ internal/balance     # single-writer ledger / balance authority
 internal/sequencer   # global ordering authority + WAL journaling + settlement
 internal/spsc        # lock-free SPSC ring buffer
 internal/wal         # segmented write-ahead log, snapshot, replay
-internal/market      # engine assembly: shards + serial/parallel topology
+internal/market      # engine assembly: shards + serial/parallel topology;
+                     #   Engine.Snapshot/Restore, Snapshotter, Recover
 internal/platform    # GC suspension, core pinning (build-tagged per OS)
 pkg/config           # env-driven configuration (read once at startup)
 pkg/logger           # thin slog wrapper (startup/shutdown only)

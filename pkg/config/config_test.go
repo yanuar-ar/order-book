@@ -76,3 +76,69 @@ func TestLoadRejectsNonNumericInt(t *testing.T) {
 		t.Fatal("expected error for non-numeric price scale, got nil")
 	}
 }
+
+// ---- Snapshot config ----
+
+func TestLoadSnapshotDefaults(t *testing.T) {
+	c, err := Load(envMap(nil))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if c.SnapshotPath != "./data/snapshots" {
+		t.Errorf("SnapshotPath = %q, want ./data/snapshots", c.SnapshotPath)
+	}
+	if c.SnapshotIntervalSecs != 3600 {
+		t.Errorf("SnapshotIntervalSecs = %d, want 3600", c.SnapshotIntervalSecs)
+	}
+	if c.SnapshotEveryN != 0 {
+		t.Errorf("SnapshotEveryN = %d, want 0", c.SnapshotEveryN)
+	}
+	if c.SnapshotRetainK != 3 {
+		t.Errorf("SnapshotRetainK = %d, want 3", c.SnapshotRetainK)
+	}
+}
+
+func TestLoadSnapshotOverrides(t *testing.T) {
+	c, err := Load(envMap(map[string]string{
+		"OB_SNAPSHOT_PATH":     "/tmp/snaps",
+		"OB_SNAPSHOT_EVERY":    "5000",
+		"OB_SNAPSHOT_INTERVAL": "0",
+		"OB_SNAPSHOT_RETAIN":   "10",
+	}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if c.SnapshotPath != "/tmp/snaps" || c.SnapshotEveryN != 5000 || c.SnapshotIntervalSecs != 0 || c.SnapshotRetainK != 10 {
+		t.Errorf("snapshot config = %+v, want path=/tmp/snaps every=5000 interval=0 retain=10",
+			[]any{c.SnapshotPath, c.SnapshotEveryN, c.SnapshotIntervalSecs, c.SnapshotRetainK})
+	}
+}
+
+func TestLoadSnapshotTimeOnlyAndCountOnlyValid(t *testing.T) {
+	// Count-only.
+	if _, err := Load(envMap(map[string]string{"OB_SNAPSHOT_EVERY": "1000", "OB_SNAPSHOT_INTERVAL": "0"})); err != nil {
+		t.Fatalf("count-only cadence rejected: %v", err)
+	}
+	// Time-only (the default interval already gives this, but be explicit).
+	if _, err := Load(envMap(map[string]string{"OB_SNAPSHOT_EVERY": "0", "OB_SNAPSHOT_INTERVAL": "60"})); err != nil {
+		t.Fatalf("time-only cadence rejected: %v", err)
+	}
+}
+
+func TestLoadRejectsNoSnapshotCadence(t *testing.T) {
+	if _, err := Load(envMap(map[string]string{"OB_SNAPSHOT_EVERY": "0", "OB_SNAPSHOT_INTERVAL": "0"})); err == nil {
+		t.Fatal("expected error when both snapshot triggers are disabled")
+	}
+}
+
+func TestLoadRejectsZeroRetain(t *testing.T) {
+	if _, err := Load(envMap(map[string]string{"OB_SNAPSHOT_RETAIN": "0"})); err == nil {
+		t.Fatal("expected error for OB_SNAPSHOT_RETAIN=0")
+	}
+}
+
+func TestLoadRejectsSnapshotPathEqualWAL(t *testing.T) {
+	if _, err := Load(envMap(map[string]string{"OB_SNAPSHOT_PATH": "./data/wal"})); err == nil {
+		t.Fatal("expected error when snapshot path equals WAL path")
+	}
+}

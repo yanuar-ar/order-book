@@ -15,6 +15,10 @@ plus self-trade prevention.
   inline closure — keeps the path allocation-free). Also `StopDump()`/`StopView`,
   a deterministic (by Seq) read view of pending stops so `tests/property` can
   include their off-book reservations in INV-BAL-03.
+- `snapshot.go` — `EncodeSnapshot` / `RestoreSnapshot` for the stop table.
+  Serializes each pending stop as its raw `FundedOrder` (`StopView` is lossy on
+  `Tif`/`Flags`/`DisplayQty`/`MaxQuote`) and restores by setting the `stops` slice
+  directly — no ledger calls, no matching.
 
 ## Constraints
 

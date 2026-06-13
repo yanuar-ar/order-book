@@ -9,7 +9,9 @@ onward; it also drains market fills and applies settlement in deterministic
 
 - `sequencer.go` — `Sequencer`, the `Journal` and `Router` interfaces,
   `ClockFunc`. Fans in producer command rings + a priority re-inject ring (stop
-  activations), assigns order, journals, routes.
+  activations), assigns order, journals, routes. `SetSeq` primes the counter to a
+  snapshot watermark during restore (quiesced only) so post-restore commands
+  continue contiguously.
 
 ## Determinism model (the whole point)
 
