@@ -42,6 +42,24 @@ Authoritative specs live in `docs/`:
 
 ## Testing is MANDATORY — non-negotiable
 
+**This is a financial, money-handling system operating in a sensitive and
+regulated domain.** Correctness is a compliance requirement, not a nicety: a
+single mispriced fill, leaked unit, or reservation error is real money lost and a
+potential regulatory incident. Because of this, the harness below is **required,
+not optional** — no change to matching, balance, book, sequencer, or WAL code may
+merge without it:
+
+- **Property / invariant tests** — `INV-*` properties asserted after every
+  command (`tests/property`, `CheckAllInvariants`).
+- **Differential tests** — every change validated against the independent
+  reference-model oracle (`tests/refmodel`) over randomized streams.
+- **Fuzz tests** — coverage-guided `go test -fuzz` plus the `pgregory.net/rapid`
+  state machine, with a permanent regression corpus.
+
+A feature-bearing change that adds engine behavior **without** extending these
+three layers is incomplete and must not ship. When in doubt, treat the
+`docs/designs/invariant-fuzz-testing-guide.md §7` checklist as the bar.
+
 Every unit test suite you write or touch MUST cover all three categories
 explicitly. A suite missing any category is incomplete:
 
