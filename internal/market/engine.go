@@ -30,15 +30,18 @@ type shardOps interface {
 	Submit(types.FundedOrder) matching.Result
 	Cancel(types.OrderID) bool
 	AmendDown(types.OrderID, types.Qty) bool
+	LastPrice() (types.Price, bool)
 }
 
 // Core implements sequencer.Router: it reserves funds, routes funded orders to
 // shards, settles fills inline, and manages the reservation lifecycle.
 type Core struct {
-	shards map[types.MarketID]shardOps
-	ledger *balance.Ledger
-	open   map[types.OrderID]openOrder
-	acks   []types.Ack // captured for tests/publisher
+	shards   map[types.MarketID]shardOps
+	ledger   *balance.Ledger
+	open     map[types.OrderID]openOrder
+	acks     []types.Ack // captured for tests/publisher
+	filters  map[types.MarketID]types.MarketFilters
+	qtyScale int64
 }
 
 // OnSettlement is unused in single-threaded mode (fills settle inline in
@@ -196,6 +199,7 @@ type Engine struct {
 // Config wires an engine.
 type Config struct {
 	Markets  map[types.MarketID]balance.MarketSpec
+	Filters  map[types.MarketID]types.MarketFilters
 	QtyScale int64
 	FeeScale int64
 	MakerFee int64
@@ -245,7 +249,7 @@ func NewEngine(cfg Config) *Engine {
 		impls[m] = s
 		shards[m] = s
 	}
-	core := &Core{shards: shards, ledger: ledger, open: make(map[types.OrderID]openOrder, 1024)}
+	core := &Core{shards: shards, ledger: ledger, open: make(map[types.OrderID]openOrder, 1024), filters: cfg.Filters, qtyScale: cfg.QtyScale}
 
 	ingress := spsc.NewCommand(cfg.RingSize)
 	reinject := spsc.NewCommand(cfg.RingSize)
