@@ -24,13 +24,17 @@ func newFilterEng(minNotional int64) *Engine {
 	})
 }
 
+// ackFor returns the most recent ack for an order id (amend produces a later
+// ack after the original accept).
 func ackFor(e *Engine, id types.OrderID) (types.Ack, bool) {
+	var found types.Ack
+	var ok bool
 	for _, a := range e.Acks() {
 		if a.OrderID == id {
-			return a, true
+			found, ok = a, true
 		}
 	}
-	return types.Ack{}, false
+	return found, ok
 }
 
 func wantReject(t *testing.T, e *Engine, id types.OrderID, reason types.RejectReason) {
@@ -106,6 +110,64 @@ func TestNewOrderFilterAccepts(t *testing.T) {
 	wantAccepted(t, e, 10)
 	if d := e.Shard(m0).Book().Depth(types.Buy, 5); len(d) != 1 || d[0].Price != 100 {
 		t.Errorf("accepted order did not rest: %+v", d)
+	}
+}
+
+func amend(id types.OrderID, price types.Price, qty types.Qty) types.Command {
+	return types.Command{Type: types.CmdAmend, Market: m0, Account: 1, OrderID: id, Price: price, Qty: qty}
+}
+
+// TestAmendDownReValidation covers AE9: an in-place reduction that would breach
+// the notional floor is rejected and the order keeps its prior quantity.
+func TestAmendDownReValidation(t *testing.T) {
+	e := newFilterEng(2000)
+	run(t, e,
+		dep(1, usdt, 1_000_000),
+		order(m0, 1, 30, types.Buy, types.Limit, 100, 20), // rests, notional 2000
+		amend(30, 100, 10),                                // amend-down -> notional 1000 < 2000
+	)
+	wantReject(t, e, 30, types.ReasonNotional)
+	// Order keeps its prior quantity (20) and reservation.
+	d := e.Shard(m0).Book().Depth(types.Buy, 5)
+	if len(d) != 1 || d[0].Qty != 20 {
+		t.Fatalf("amend-down should have left qty 20 resting, got %+v", d)
+	}
+	if r := e.Ledger().Reserved(1, usdt); r != 2000 {
+		t.Errorf("reservation changed after rejected amend-down: %d, want 2000", r)
+	}
+}
+
+// TestAmendDownOffStepRejected: reducing to an off-step quantity is rejected.
+func TestAmendDownOffStepRejected(t *testing.T) {
+	e := newFilterEng(1000)
+	run(t, e,
+		dep(1, usdt, 1_000_000),
+		order(m0, 1, 31, types.Buy, types.Limit, 100, 20),
+		amend(31, 100, 12), // 12 is off-step
+	)
+	wantReject(t, e, 31, types.ReasonLotSize)
+	if d := e.Shard(m0).Book().Depth(types.Buy, 5); len(d) != 1 || d[0].Qty != 20 {
+		t.Fatalf("order should still rest at qty 20, got %+v", d)
+	}
+}
+
+// TestAmendPriceChangeValidatedViaNewOrder covers AE10: an amend that changes
+// price to an off-tick value is rejected through the cancel/re-submit path.
+func TestAmendPriceChangeValidatedViaNewOrder(t *testing.T) {
+	e := newFilterEng(1000)
+	run(t, e,
+		dep(1, usdt, 1_000_000),
+		order(m0, 1, 32, types.Buy, types.Limit, 100, 20),
+		amend(32, 105, 20), // price change to off-tick -> re-submit rejected
+	)
+	wantReject(t, e, 32, types.ReasonPriceFilter)
+	// Cancel-replace already removed the original; the rejected replacement does
+	// not rest. No reservation remains.
+	if d := e.Shard(m0).Book().Depth(types.Buy, 5); len(d) != 0 {
+		t.Fatalf("book should be empty after rejected price-change amend, got %+v", d)
+	}
+	if r := e.Ledger().Reserved(1, usdt); r != 0 {
+		t.Errorf("reservation leaked after rejected price-change amend: %d", r)
 	}
 }
 

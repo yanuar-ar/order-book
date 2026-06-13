@@ -168,6 +168,15 @@ func (c *Core) amend(cmd types.Command) {
 	sh := c.shards[oo.market]
 	// Quantity decrease at the same price: amend in place, keep time priority.
 	if cmd.Price == oo.price && cmd.Qty < oo.qty {
+		// Re-validate the reduced quantity so an amend can't leave a resting order
+		// off-lot or below the notional floor. Price is unchanged. On reject the
+		// order keeps its prior quantity.
+		if f, ok := c.filters[oo.market]; ok {
+			if reason := f.ValidateAmendDown(oo.price, cmd.Qty, c.qtyScale); reason != types.ReasonNone {
+				c.ack(cmd, types.AckRejected, reason)
+				return
+			}
+		}
 		if sh.AmendDown(cmd.OrderID, cmd.Qty) {
 			c.ledger.AmendReduce(cmd.OrderID, oo.side, oo.price, cmd.Qty)
 			oo.qty = cmd.Qty
