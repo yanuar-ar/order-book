@@ -347,6 +347,10 @@ func (e *Engine) Acks() []types.Ack { return e.core.acks }
 // Seq returns the last assigned sequence number.
 func (e *Engine) Seq() types.Seq { return e.seq.Seq() }
 
+// Fatal returns the latched terminal WAL-durability failure, or nil. The host
+// run loop checks this after each Step; the snapshotter checks it after Drain.
+func (e *Engine) Fatal() error { return e.seq.Fatal() }
+
 // SetSeq primes the sequencer watermark. Used by snapshot restore (before live
 // stepping resumes) so post-restore commands continue contiguously.
 func (e *Engine) SetSeq(s types.Seq) { e.seq.SetSeq(s) }

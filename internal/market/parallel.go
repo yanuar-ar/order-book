@@ -252,6 +252,9 @@ func (pe *ParallelEngine) Acks() []types.Ack { return pe.core.acks }
 // Seq returns the last assigned sequence number.
 func (pe *ParallelEngine) Seq() types.Seq { return pe.seq.Seq() }
 
+// Fatal returns the latched terminal WAL-durability failure, or nil.
+func (pe *ParallelEngine) Fatal() error { return pe.seq.Fatal() }
+
 // MarketIDs returns market ids in ascending order.
 func (pe *ParallelEngine) MarketIDs() []types.MarketID {
 	ids := make([]types.MarketID, 0, len(pe.impls))

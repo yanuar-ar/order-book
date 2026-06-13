@@ -1,6 +1,7 @@
 package sequencer
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/yanuar-ar/order-book/internal/spsc"
@@ -11,6 +12,23 @@ import (
 type fakeJournal struct{ recs []wal.Record }
 
 func (j *fakeJournal) Append(r wal.Record) error { j.recs = append(j.recs, r); return nil }
+
+// failingJournal fails Append on the failAt-th call (1-based), succeeding before.
+type failingJournal struct {
+	recs   []wal.Record
+	calls  int
+	failAt int
+	err    error
+}
+
+func (j *failingJournal) Append(r wal.Record) error {
+	j.calls++
+	if j.calls == j.failAt {
+		return j.err
+	}
+	j.recs = append(j.recs, r)
+	return nil
+}
 
 type fakeRouter struct {
 	cmds        []types.Command
@@ -141,6 +159,36 @@ func TestReinjectDrainedBeforeExternalInSameTick(t *testing.T) {
 	}
 	if len(j.recs) != 2 {
 		t.Fatalf("both reinject and external must be journaled, got %d", len(j.recs))
+	}
+}
+
+func TestJournalAppendFailureLatchesFatalAndReleasesNoAck(t *testing.T) {
+	in := spsc.NewCommand(16)
+	in.Push(cmd(100)) // first command: journals fine
+	in.Push(cmd(101)) // second command: Append fails
+	in.Push(cmd(102)) // must never be routed after fatal
+	j := &failingJournal{failAt: 2, err: errors.New("disk full")}
+	r := &fakeRouter{}
+	s := New(Config{Inputs: []*spsc.RingCommand{in}, Journal: j, Router: r, Clock: clockSeq(0)})
+
+	if !s.Step() { // command 100
+		t.Fatal("first Step should do work")
+	}
+	s.Step() // command 101: Append fails -> latch fatal, no route
+
+	if s.Fatal() == nil {
+		t.Fatal("Fatal() should be set after an Append failure")
+	}
+	// The failed command must not have been routed (no ack produced for it).
+	if len(r.cmds) != 1 || r.cmds[0].OrderID != 100 {
+		t.Fatalf("routed = %+v, want only the first command (no route for the failed one)", r.cmds)
+	}
+	// Once fatal, further Steps are no-ops: command 102 is never routed.
+	if s.Step() {
+		t.Fatal("Step after fatal should report no work")
+	}
+	if len(r.cmds) != 1 {
+		t.Fatalf("routed %d commands after fatal, want 1 (no further routing)", len(r.cmds))
 	}
 }
 

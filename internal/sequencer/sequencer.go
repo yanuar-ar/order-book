@@ -45,6 +45,12 @@ type Sequencer struct {
 
 	seq types.Seq
 	rr  int // round-robin cursor over inputs
+
+	// fatal latches a terminal WAL-durability failure. Once set, Step is a no-op
+	// and Run exits: the WAL is the source of truth, so the engine must not
+	// match or release any further output once journaling is broken. No pending
+	// ack is released after a fatal latches. Surfaced to the host via Fatal().
+	fatal error
 }
 
 // Config wires a sequencer.
@@ -92,30 +98,49 @@ func (s *Sequencer) Inject(c types.Command) bool {
 //  2. drain all pending stop activations (priority), sequencing each;
 //  3. sequence one external command (round-robin).
 //
-// It reports whether any work was done.
+// It reports whether any work was done. Once a fatal WAL-durability failure has
+// latched, Step is a no-op and reports no work; the caller surfaces it via
+// Fatal().
 func (s *Sequencer) Step() bool {
+	if s.fatal != nil {
+		return false
+	}
 	did := s.drainFills()
 	if s.reinject != nil {
 		var c types.Command
 		for s.reinject.Pop(&c) {
-			s.sequenceAndRoute(&c)
+			if err := s.sequenceAndRoute(&c); err != nil {
+				s.fatal = err
+				return did
+			}
 			did = true
 		}
 	}
 	if c, ok := s.pollExternal(); ok {
-		s.sequenceAndRoute(&c)
+		if err := s.sequenceAndRoute(&c); err != nil {
+			s.fatal = err
+			return did
+		}
 		did = true
 	}
 	return did
 }
 
-// Run loops Step until stop is closed (busy-spin). Used by the assembled engine.
+// Fatal returns the latched terminal WAL-durability failure, or nil. The host
+// run loop checks this after each Step and halts on a non-nil result.
+func (s *Sequencer) Fatal() error { return s.fatal }
+
+// Run loops Step until stop is closed or a fatal latches (busy-spin). Used by
+// the assembled engine.
 func (s *Sequencer) Run(stop <-chan struct{}) {
 	for {
 		select {
 		case <-stop:
 			return
 		default:
+			if s.fatal != nil {
+				return
+			}
 			s.Step()
 		}
 	}
@@ -157,15 +182,21 @@ func (s *Sequencer) pollExternal() (types.Command, bool) {
 	return types.Command{}, false
 }
 
-func (s *Sequencer) sequenceAndRoute(c *types.Command) {
+// sequenceAndRoute assigns the next Seq + timestamp, journals the command, and
+// routes it. A journal failure is returned without routing — so no ack is
+// produced for an undurable command — and the caller latches it as fatal.
+func (s *Sequencer) sequenceAndRoute(c *types.Command) error {
 	s.seq++
 	c.Seq = s.seq
 	c.TsNanos = s.clock() // wall-clock read happens only here
-	_ = s.journal.Append(wal.Record{
+	if err := s.journal.Append(wal.Record{
 		Seq:     uint64(s.seq),
 		TsNanos: c.TsNanos,
 		Type:    uint16(c.Type),
 		Payload: types.EncodeCommand(*c),
-	})
+	}); err != nil {
+		return err
+	}
 	s.router.OnCommand(*c)
+	return nil
 }
