@@ -148,6 +148,28 @@ func TestOrderTypesAndInvariants(t *testing.T) {
 	checkInvariants(t, e, deposited)
 }
 
+// A market buy against deep, cheap liquidity must be bounded by the buyer's
+// funds — it can never out-spend its reservation, and value stays conserved.
+func TestMarketBuyFundsCapConservation(t *testing.T) {
+	e := market.NewEngine(cfg(0, 0)) // zero fee, QtyScale=1: notional = price*qty
+	deposited := map[types.AssetID]int64{usdt: 50, btc: 1000}
+	run(e,
+		dep(2, btc, 1000),
+		dep(1, usdt, 50),
+		ord(mBTC, 2, 20, types.Sell, types.Limit, types.GTC, 1, 1000), // 1000 units @ price 1
+		// Market buy for far more than the buyer can afford (only 50 USDT).
+		types.Command{Type: types.CmdNewOrder, Market: mBTC, Account: 1, OrderID: 10, Side: types.Buy, OrdType: types.Market, Tif: types.GTC, Qty: 1000},
+	)
+	led := e.Ledger()
+	if got := led.Available(1, btc); got != 50 {
+		t.Fatalf("buyer BTC = %d, want 50 (capped by 50 USDT budget)", got)
+	}
+	if led.Available(1, usdt) != 0 {
+		t.Fatalf("buyer USDT = %d, want 0 (fully spent within budget)", led.Available(1, usdt))
+	}
+	checkInvariants(t, e, deposited)
+}
+
 func TestRecoveryDeterminismViaReplay(t *testing.T) {
 	dir := t.TempDir()
 	w, err := wal.OpenWriter(dir, 0)

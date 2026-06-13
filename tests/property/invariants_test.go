@@ -165,6 +165,50 @@ func TestSameSeedProducesIdenticalState(t *testing.T) {
 	}
 }
 
+// TestTightBudgetMarketLoadConserves stresses the market-buy funds cap: small
+// quote balances plus a market-heavy flow means many market buys would
+// out-spend their funds if uncapped. Conservation and no-negative must still
+// hold at every checkpoint.
+func TestTightBudgetMarketLoadConserves(t *testing.T) {
+	r := rand.New(rand.NewSource(2026))
+	e := market.NewEngine(engineConfig())
+	deposited := map[types.AssetID]int64{}
+
+	const accts = 6
+	for a := types.AccountID(1); a <= accts; a++ {
+		e.Submit(types.Command{Type: types.CmdDeposit, Account: a, Asset: usdt, Amount: 2000})
+		deposited[usdt] += 2000
+		for _, b := range marketBase {
+			e.Submit(types.Command{Type: types.CmdDeposit, Account: a, Asset: b, Amount: 5000})
+			deposited[b] += 5000
+		}
+	}
+	e.Drain()
+	checkInvariants(t, e, deposited)
+
+	mkts := []types.MarketID{0, 1, 2}
+	var id types.OrderID = 5000
+	for i := 0; i < 4000; i++ {
+		id++
+		m := mkts[r.Intn(len(mkts))]
+		acct := types.AccountID(1 + r.Intn(accts))
+		side := types.Side(r.Intn(2))
+		c := types.Command{Type: types.CmdNewOrder, Market: m, Account: acct, OrderID: id, Side: side, Price: types.Price(95 + r.Intn(11)), Qty: types.Qty(1 + r.Intn(40))}
+		if r.Intn(2) == 0 { // half are market orders that could out-spend without the cap
+			c.OrdType = types.Market
+		} else {
+			c.OrdType = types.Limit
+		}
+		e.Submit(c)
+		if i%200 == 0 {
+			e.Drain()
+			checkInvariants(t, e, deposited)
+		}
+	}
+	e.Drain()
+	checkInvariants(t, e, deposited)
+}
+
 // TestDifferentSeedsDiverge is a sanity check that the generator and digest are
 // actually sensitive to input (guards against a digest that ignores state).
 func TestDifferentSeedsDiverge(t *testing.T) {

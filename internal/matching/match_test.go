@@ -13,7 +13,7 @@ func (s *collectSink) Emit(c types.Command) { s.cmds = append(s.cmds, c) }
 
 func newEngine() (*Engine, *collectSink) {
 	s := &collectSink{}
-	return NewEngine(orderbook.New(0, 64), s), s
+	return NewEngine(orderbook.New(0, 64), s, 1), s
 }
 
 // fo builds a funded order; price 0 with Market type means no price limit.
@@ -23,6 +23,13 @@ func fo(seq types.Seq, acct types.AccountID, id types.OrderID, side types.Side, 
 
 func lim(seq types.Seq, acct types.AccountID, id types.OrderID, side types.Side, price types.Price, qty types.Qty) types.FundedOrder {
 	return fo(seq, acct, id, side, types.Limit, types.GTC, price, qty)
+}
+
+// mktBuy is a market buy with an effectively-unlimited budget (sweep tests).
+func mktBuy(seq types.Seq, acct types.AccountID, id types.OrderID, qty types.Qty) types.FundedOrder {
+	o := fo(seq, acct, id, types.Buy, types.Market, types.GTC, 0, qty)
+	o.MaxQuote = 1 << 40
+	return o
 }
 
 // ---- Positive cases ----
@@ -61,7 +68,7 @@ func TestMarketSweepsMultipleLevels(t *testing.T) {
 	e, _ := newEngine()
 	e.Submit(lim(1, 10, 100, types.Sell, 100, 2))
 	e.Submit(lim(2, 10, 101, types.Sell, 101, 3))
-	res := e.Submit(fo(3, 20, 300, types.Buy, types.Market, types.GTC, 0, 4))
+	res := e.Submit(mktBuy(3, 20, 300, 4))
 	if len(res.Fills) != 2 {
 		t.Fatalf("fills = %d, want 2", len(res.Fills))
 	}
@@ -130,7 +137,7 @@ func TestIcebergReplenishAndRequeue(t *testing.T) {
 	e.Submit(lim(2, 11, 200, types.Sell, 100, 3))
 
 	// Buy 2 consumes A's visible chunk; A replenishes and re-queues behind B.
-	res := e.Submit(fo(3, 20, 300, types.Buy, types.Market, types.GTC, 0, 2))
+	res := e.Submit(mktBuy(3, 20, 300, 2))
 	if len(res.Fills) != 1 || res.Fills[0].Qty != 2 {
 		t.Fatalf("fills = %+v, want one fill qty2 from iceberg", res.Fills)
 	}
@@ -197,7 +204,7 @@ func TestSelfTradePreventionCancelsAggressorRemainder(t *testing.T) {
 
 func TestMarketOnEmptyBookCancels(t *testing.T) {
 	e, _ := newEngine()
-	res := e.Submit(fo(1, 20, 100, types.Buy, types.Market, types.GTC, 0, 5))
+	res := e.Submit(mktBuy(1, 20, 100, 5))
 	if len(res.Fills) != 0 || res.Rested {
 		t.Fatalf("market on empty book = %+v, want no fills, no rest", res)
 	}
@@ -206,7 +213,7 @@ func TestMarketOnEmptyBookCancels(t *testing.T) {
 func TestMarketPartialFillCancelsRemainder(t *testing.T) {
 	e, _ := newEngine()
 	e.Submit(lim(1, 10, 100, types.Sell, 100, 2))
-	res := e.Submit(fo(2, 20, 200, types.Buy, types.Market, types.GTC, 0, 5))
+	res := e.Submit(mktBuy(2, 20, 200, 5))
 	if len(res.Fills) != 1 || res.Fills[0].Qty != 2 {
 		t.Fatalf("fills = %+v, want one fill qty2", res.Fills)
 	}
@@ -237,11 +244,71 @@ func TestPriceCrossBoundaryIsInclusive(t *testing.T) {
 	}
 }
 
+// ---- market-buy funds cap (MaxQuote) ----
+
+// marketBuy builds a market buy with a quote budget (qtyScale=1, so notional = price*qty).
+func marketBuy(seq types.Seq, acct types.AccountID, id types.OrderID, qty types.Qty, maxQuote int64) types.FundedOrder {
+	o := fo(seq, acct, id, types.Buy, types.Market, types.GTC, 0, qty)
+	o.MaxQuote = maxQuote
+	return o
+}
+
+func filledQty(fills []types.Fill) types.Qty {
+	var q types.Qty
+	for _, f := range fills {
+		q += f.Qty
+	}
+	return q
+}
+
+// positive: budget caps the swept quantity below available liquidity.
+func TestMarketBuyCappedByBudget(t *testing.T) {
+	e, _ := newEngine()
+	e.Submit(lim(1, 10, 100, types.Sell, 10, 100))  // 100 units available @10 (notional 10 each)
+	res := e.Submit(marketBuy(2, 20, 200, 100, 50)) // budget 50 -> 5 units
+	if got := filledQty(res.Fills); got != 5 {
+		t.Fatalf("filled %d, want 5 (budget 50 / price 10)", got)
+	}
+	if res.Rested {
+		t.Fatal("market order must not rest")
+	}
+}
+
+// edge: budget exactly covers a whole number of units.
+func TestMarketBuyExactBudget(t *testing.T) {
+	e, _ := newEngine()
+	e.Submit(lim(1, 10, 100, types.Sell, 10, 100))
+	res := e.Submit(marketBuy(2, 20, 200, 100, 30)) // exactly 3 units
+	if got := filledQty(res.Fills); got != 3 {
+		t.Fatalf("filled %d, want 3", got)
+	}
+}
+
+// edge: a zero budget (dust funds) fills nothing — never mistaken for unlimited.
+func TestMarketBuyZeroBudgetFillsNothing(t *testing.T) {
+	e, _ := newEngine()
+	e.Submit(lim(1, 10, 100, types.Sell, 10, 7))
+	res := e.Submit(marketBuy(2, 20, 200, 100, 0)) // budget 0 -> no fills
+	if got := filledQty(res.Fills); got != 0 {
+		t.Fatalf("filled %d, want 0 (zero budget)", got)
+	}
+}
+
+// negative: budget too small for even one unit -> no fill.
+func TestMarketBuyBudgetTooSmall(t *testing.T) {
+	e, _ := newEngine()
+	e.Submit(lim(1, 10, 100, types.Sell, 10, 100))
+	res := e.Submit(marketBuy(2, 20, 200, 100, 5)) // 5 < price 10 -> 0 units
+	if got := filledQty(res.Fills); got != 0 {
+		t.Fatalf("filled %d, want 0 (budget below one unit)", got)
+	}
+}
+
 func TestMatchIndexFormsTotalOrderPerAggressor(t *testing.T) {
 	e, _ := newEngine()
 	e.Submit(lim(1, 10, 100, types.Sell, 100, 2)) // maker A
 	e.Submit(lim(2, 11, 101, types.Sell, 100, 2)) // maker B (FIFO behind A)
-	res := e.Submit(fo(7, 20, 700, types.Buy, types.Market, types.GTC, 0, 4))
+	res := e.Submit(mktBuy(7, 20, 700, 4))
 	if len(res.Fills) != 2 {
 		t.Fatalf("want 2 fills, got %d", len(res.Fills))
 	}

@@ -220,6 +220,48 @@ func TestUnsettledProceedsNotSpendable(t *testing.T) {
 	}
 }
 
+// ---- market-buy budget ----
+
+func TestMarketBuyBudgetZeroFee(t *testing.T) {
+	l := newLedger(0, 0, 100)
+	l.Deposit(1, usdt, 1000)
+	if b := l.MarketBuyBudget(1, mkt); b != 1000 {
+		t.Fatalf("budget = %d, want 1000 (no fee)", b)
+	}
+}
+
+func TestMarketBuyBudgetWithTakerFee(t *testing.T) {
+	l := newLedger(0, 2, 100) // 2% taker
+	l.Deposit(1, usdt, 1000)
+	// max notional N with N + 2%N <= 1000 -> N = 1000*100/102 = 980 (floor).
+	if b := l.MarketBuyBudget(1, mkt); b != 980 {
+		t.Fatalf("budget = %d, want 980", b)
+	}
+}
+
+func TestMarketBuyBudgetEmptyAccount(t *testing.T) {
+	l := newLedger(0, 2, 100)
+	if b := l.MarketBuyBudget(1, mkt); b != 0 {
+		t.Fatalf("budget = %d, want 0 (no funds)", b)
+	}
+}
+
+func TestOrderBudgetUnknownIsZero(t *testing.T) {
+	l := newLedger(0, 0, 100)
+	if b := l.OrderBudget(999); b != 0 {
+		t.Fatalf("OrderBudget(unknown) = %d, want 0", b)
+	}
+}
+
+func TestOrderBudgetFromReservation(t *testing.T) {
+	l := newLedger(0, 0, 100)
+	l.Deposit(1, usdt, 500)
+	l.Reserve(buy(10, 1, types.Market, 0, 0)) // market buy reserves all 500
+	if b := l.OrderBudget(10); b != 500 {
+		t.Fatalf("OrderBudget = %d, want 500 (no fee)", b)
+	}
+}
+
 func TestNoNegativeBalanceAcrossSequence(t *testing.T) {
 	l := newLedger(0, 0, 100)
 	l.Deposit(1, usdt, 100)
