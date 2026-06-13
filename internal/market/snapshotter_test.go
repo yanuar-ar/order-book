@@ -1,12 +1,83 @@
 package market
 
 import (
+	"errors"
 	"testing"
 
+	"github.com/yanuar-ar/order-book/internal/balance"
 	"github.com/yanuar-ar/order-book/internal/types"
+	"github.com/yanuar-ar/order-book/internal/wal"
 )
 
 func fixedClock(v *int64) func() int64 { return func() int64 { return *v } }
+
+// alwaysFailJournal fails every Append, used to drive a fail-stop during a
+// snapshot's drain.
+type alwaysFailJournal struct{}
+
+func (alwaysFailJournal) Append(wal.Record) error { return errors.New("journal append failed") }
+
+// ---- U4: snapshot ordering vs the durable watermark ----
+
+func TestSnapshot_SeqNeverExceedsDurable(t *testing.T) {
+	e := newEng(0, 0, 100, false)
+	for _, c := range []types.Command{dep(1, usdt, 1000), dep(2, btc, 10), order(m0, 1, 10, types.Buy, types.Limit, 100, 5)} {
+		if !e.Submit(c) {
+			t.Fatal("ingress full")
+		}
+	}
+	// Step without draining: speculative state exists above the watermark.
+	for i := 0; i < 3; i++ {
+		e.Step()
+	}
+	if e.DurableSeq() >= e.Seq() {
+		t.Fatalf("precondition: durableSeq=%d should trail seq=%d before snapshot", e.DurableSeq(), e.Seq())
+	}
+
+	dir := t.TempDir()
+	clk := int64(0)
+	s := NewSnapshotter(dir, 1, 0, 5, fixedClock(&clk))
+	s.Anchor(0)
+	if wrote, err := s.Maybe(e, 3); err != nil || !wrote {
+		t.Fatalf("snapshot did not fire (wrote=%v err=%v)", wrote, err)
+	}
+	// The snapshot drained first, so the watermark caught up and the published
+	// file (named by Seq) is fully durable.
+	if e.DurableSeq() != e.Seq() {
+		t.Fatalf("after snapshot durableSeq=%d != seq=%d", e.DurableSeq(), e.Seq())
+	}
+	if files, _ := snapshotFiles(dir); len(files) != 1 {
+		t.Fatalf("expected 1 snapshot file, got %d", len(files))
+	}
+}
+
+func TestSnapshot_AbortsOnFailStopDuringDrain(t *testing.T) {
+	cfg := Config{
+		Markets:  map[types.MarketID]balance.MarketSpec{m0: {Base: btc, Quote: usdt}},
+		QtyScale: 1, FeeScale: 100, RingSize: 1024, CapHint: 256,
+		Journal: alwaysFailJournal{},
+	}
+	e := NewEngine(cfg)
+	if !e.Submit(dep(1, usdt, 1000)) {
+		t.Fatal("ingress full")
+	}
+
+	dir := t.TempDir()
+	clk := int64(0)
+	s := NewSnapshotter(dir, 1, 0, 5, fixedClock(&clk))
+	s.Anchor(0)
+	// Snapshot drains, the pending command's append fails -> fatal latches ->
+	// Snapshot must return the error and publish nothing.
+	if _, err := s.Maybe(e, 1); err == nil {
+		t.Fatal("snapshot should abort on a fail-stop during drain")
+	}
+	if e.Fatal() == nil {
+		t.Fatal("engine should be fail-stopped")
+	}
+	if files, _ := snapshotFiles(dir); len(files) != 0 {
+		t.Fatalf("no snapshot should be published on fail-stop, got %d files", len(files))
+	}
+}
 
 // ---- Count trigger ----
 

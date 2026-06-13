@@ -366,6 +366,9 @@ func (e *Engine) Seq() types.Seq { return e.seq.Seq() }
 // run loop checks this after each Step; the snapshotter checks it after Drain.
 func (e *Engine) Fatal() error { return e.seq.Fatal() }
 
+// DurableSeq returns the highest Seq whose WAL bytes have been fsynced.
+func (e *Engine) DurableSeq() types.Seq { return e.seq.DurableSeq() }
+
 // SetSeq primes the sequencer watermark. Used by snapshot restore (before live
 // stepping resumes) so post-restore commands continue contiguously.
 func (e *Engine) SetSeq(s types.Seq) { e.seq.SetSeq(s) }
