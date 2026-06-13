@@ -53,29 +53,71 @@ func RunDifferentialParallel(stream Stream, groups [][]types.MarketID) error {
 	return runDifferential(pe, stream)
 }
 
+// drainSubmit submits c and drains the engine, retrying when the ingress ring
+// is full (the parallel path can backpressure).
+func drainSubmit(e Driver, c types.Command) {
+	for !e.Submit(c) {
+		e.Step()
+	}
+	e.Drain()
+}
+
+// applyNet submits c and updates the net external-flow map: deposits of amount>0
+// always succeed; a withdrawal's effect is read from the engine's own
+// available-balance delta (so accepted/rejected withdrawals both stay exact).
+// This keeps the conservation check (INV-BAL-04) correct for streams that
+// include withdrawals.
+func applyNet(net map[types.AssetID]int64, e Driver, c types.Command) {
+	switch c.Type {
+	case types.CmdDeposit:
+		if c.Amount > 0 {
+			net[c.Asset] += c.Amount
+		}
+		drainSubmit(e, c)
+	case types.CmdWithdraw:
+		before := e.Ledger().Available(c.Account, c.Asset)
+		drainSubmit(e, c)
+		net[c.Asset] -= before - e.Ledger().Available(c.Account, c.Asset)
+	default:
+		drainSubmit(e, c)
+	}
+}
+
+// feedTrackingNet applies a whole stream to e and returns the exact net external
+// flow per asset. Used by recovery/metamorphic tests that need the conservation
+// baseline for streams that may contain withdrawals.
+func feedTrackingNet(e Driver, s Stream) map[types.AssetID]int64 {
+	net := map[types.AssetID]int64{}
+	for _, c := range s.Deposits {
+		applyNet(net, e, c)
+	}
+	for i := range s.Orders {
+		c := s.Orders[i]
+		c.Seq = types.Seq(i + 1)
+		applyNet(net, e, c)
+	}
+	return net
+}
+
 func runDifferential(e Driver, stream Stream) error {
 	mod := refmodel.New(modelCfg())
+	net := map[types.AssetID]int64{}
 
-	apply := func(c types.Command) {
-		for !e.Submit(c) { // ingress full (parallel path): drain one and retry
-			e.Step()
-		}
-		e.Drain()
-		mod.Apply(c)
-	}
 	for _, c := range stream.Deposits {
-		apply(c)
+		applyNet(net, e, c)
+		mod.Apply(c)
 	}
 	for i, c := range stream.Orders {
 		c.Seq = types.Seq(i + 1) // monotonic; keeps model stop-ordering aligned with the engine
-		apply(c)
+		applyNet(net, e, c)
+		mod.Apply(c)
 
 		eng := engineState(e).Canonical()
 		ref := mod.Snapshot().Canonical()
 		if eng != ref {
 			return fmt.Errorf("state diverged at order step %d (cmd %+v):\n--- engine ---\n%s\n--- model ---\n%s", i, c, eng, ref)
 		}
-		if err := CheckAllInvariants(e, stream.NetDeposits); err != nil {
+		if err := CheckAllInvariants(e, net); err != nil {
 			return fmt.Errorf("invariant violated at order step %d (cmd %+v): %w", i, c, err)
 		}
 	}

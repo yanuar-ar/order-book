@@ -12,8 +12,8 @@ import (
 
 // journalStream runs a stream through a fresh engine whose Journal is a real
 // WAL writer in dir, then closes the writer and returns the engine's canonical
-// state. Commands are submitted then drained; the sequencer assigns Seq.
-func journalStream(t *testing.T, dir string, s Stream) string {
+// state plus the exact net external flow (accounting for any withdrawals).
+func journalStream(t *testing.T, dir string, s Stream) (string, map[types.AssetID]int64) {
 	t.Helper()
 	w, err := wal.OpenWriter(dir, 0)
 	if err != nil {
@@ -22,17 +22,11 @@ func journalStream(t *testing.T, dir string, s Stream) string {
 	cfg := engineCfg()
 	cfg.Journal = w
 	e := market.NewEngine(cfg)
-	for _, c := range s.Deposits {
-		e.Submit(c)
-	}
-	for _, c := range s.Orders {
-		e.Submit(c)
-	}
-	e.Drain()
+	net := feedTrackingNet(e, s)
 	if err := w.Close(); err != nil {
 		t.Fatalf("close WAL: %v", err)
 	}
-	return engineState(e).Canonical()
+	return engineState(e).Canonical(), net
 }
 
 // replayInto builds a stops-suppressed engine and replays the WAL in dir into
@@ -62,13 +56,13 @@ func replayInto(t *testing.T, dir string) *market.Engine {
 func TestRecoveryFullReplayEquivalence(t *testing.T) {
 	dir := t.TempDir()
 	s := GenSharp(5, 1200)
-	want := journalStream(t, dir, s)
+	want, net := journalStream(t, dir, s)
 
 	e2 := replayInto(t, dir)
 	if got := engineState(e2).Canonical(); got != want {
 		t.Fatal("replayed state differs from original")
 	}
-	if err := CheckAllInvariants(e2, s.NetDeposits); err != nil {
+	if err := CheckAllInvariants(e2, net); err != nil {
 		t.Fatalf("replayed state violates invariants: %v", err)
 	}
 }
@@ -115,13 +109,7 @@ func TestRecoveryTornTail(t *testing.T) {
 func TestRecoveryMetamorphicCancelAll(t *testing.T) {
 	e := market.NewEngine(engineCfg())
 	s := GenSharp(8, 1000)
-	for _, c := range s.Deposits {
-		e.Submit(c)
-	}
-	for _, c := range s.Orders {
-		e.Submit(c)
-	}
-	e.Drain()
+	net := feedTrackingNet(e, s)
 
 	for _, m := range e.MarketIDs() {
 		for _, o := range e.Shard(m).Book().Dump() {
@@ -147,7 +135,7 @@ func TestRecoveryMetamorphicCancelAll(t *testing.T) {
 			t.Fatalf("INV-MET-02: acct %d asset %d still reserved %d after cancel-all", b.Acct, b.Asset, b.Reserved)
 		}
 	}
-	if err := CheckAllInvariants(e, s.NetDeposits); err != nil {
+	if err := CheckAllInvariants(e, net); err != nil {
 		t.Fatalf("conservation broken after cancel-all: %v", err)
 	}
 }

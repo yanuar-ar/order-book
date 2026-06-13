@@ -113,10 +113,21 @@ func genStream(seed int64, n int, sharp bool) Stream {
 	for i := 0; i < n; i++ {
 		roll := r.Intn(100)
 		switch {
-		case len(issued) > 0 && roll < 10:
+		case roll < 5:
+			// Withdraw a small amount (the engine accepts or rejects based on
+			// available funds; both engine and model agree).
+			asset := genQuote
+			if r.Intn(2) == 0 {
+				asset = genBases[r.Intn(len(genBases))]
+			}
+			orders = append(orders, types.Command{
+				Type: types.CmdWithdraw, Account: types.AccountID(1 + r.Intn(genAccounts)),
+				Asset: asset, Amount: int64(1 + r.Intn(50)),
+			})
+		case len(issued) > 0 && roll < 14:
 			// Cancel a previously-issued order (no-op if already gone — idempotent).
 			orders = append(orders, types.Command{Type: types.CmdCancel, OrderID: issued[r.Intn(len(issued))]})
-		case len(issued) > 0 && roll < 18:
+		case len(issued) > 0 && roll < 22:
 			// Amend a previously-issued order to a new price/qty.
 			orders = append(orders, types.Command{
 				Type: types.CmdAmend, OrderID: issued[r.Intn(len(issued))],

@@ -31,8 +31,15 @@ func TestEngineStateMachine(t *testing.T) {
 		for i := 0; i < steps; i++ {
 			c := drawCommand(rt, &id, &issued)
 			c.Seq = types.Seq(i + 1)
-			e.Submit(c)
-			e.Drain()
+			if c.Type == types.CmdWithdraw {
+				before := e.Ledger().Available(c.Account, c.Asset)
+				e.Submit(c)
+				e.Drain()
+				net[c.Asset] -= before - e.Ledger().Available(c.Account, c.Asset)
+			} else {
+				e.Submit(c)
+				e.Drain()
+			}
 			mod.Apply(c)
 
 			if eng, ref := engineState(e).Canonical(), mod.Snapshot().Canonical(); eng != ref {
@@ -50,6 +57,16 @@ func drawCommand(rt *rapid.T, id *types.OrderID, issued *[]types.OrderID) types.
 	if len(*issued) > 0 && kind == 0 {
 		sel := rapid.IntRange(0, len(*issued)-1).Draw(rt, "cancelSel")
 		return types.Command{Type: types.CmdCancel, OrderID: (*issued)[sel]}
+	}
+	if kind == 2 {
+		asset := genQuote
+		if rapid.Bool().Draw(rt, "wdBase") {
+			asset = rapid.SampledFrom(genBases).Draw(rt, "wdAsset")
+		}
+		return types.Command{
+			Type: types.CmdWithdraw, Account: types.AccountID(rapid.IntRange(1, genAccounts).Draw(rt, "wdAcct")),
+			Asset: asset, Amount: int64(rapid.IntRange(1, 50).Draw(rt, "wdAmt")),
+		}
 	}
 	if len(*issued) > 0 && kind == 1 {
 		sel := rapid.IntRange(0, len(*issued)-1).Draw(rt, "amendSel")

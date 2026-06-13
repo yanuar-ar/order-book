@@ -29,9 +29,18 @@ func decodeStream(data []byte) Stream {
 	for pos < len(data) && len(orders) < 400 {
 		op := next()
 		switch {
-		case op%6 == 0 && len(issued) > 0:
+		case op%7 == 0 && len(issued) > 0:
 			orders = append(orders, types.Command{Type: types.CmdCancel, OrderID: issued[int(next())%len(issued)]})
-		case op%6 == 1 && len(issued) > 0:
+		case op%7 == 2:
+			asset := genQuote
+			if int(op)%2 == 0 {
+				asset = genBases[int(next())%len(genBases)]
+			}
+			orders = append(orders, types.Command{
+				Type: types.CmdWithdraw, Account: types.AccountID(1 + int(next())%genAccounts),
+				Asset: asset, Amount: int64(1 + int(next())%50),
+			})
+		case op%7 == 1 && len(issued) > 0:
 			sel, pr, q := next(), next(), next()
 			orders = append(orders, types.Command{
 				Type: types.CmdAmend, OrderID: issued[int(sel)%len(issued)],
