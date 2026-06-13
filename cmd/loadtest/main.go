@@ -38,13 +38,21 @@ var marketName = map[types.MarketID]string{0: "BTC/USDT", 1: "ETH/USDT", 2: "SOL
 var marketWeights = []types.MarketID{0, 0, 0, 0, 0, 1, 1, 1, 2, 2}
 
 const (
-	// Price model: integer ticks where 1 tick = $0.01, base mid = $100.00.
-	// This gives a realistic deep ladder and decimal price display.
-	baseMid   types.Price = 10_000
-	priceDiv              = 100.0 // ticks -> dollars for display
-	depthBand             = 60    // maker orders rest up to this many ticks from mid
-	maxQtyGen             = 50
+	// Price model: 1 tick = $0.01, so a price is in cents. Quantities are in
+	// 1e-8 base units (e.g., satoshis), matching real crypto venues.
+	priceDiv     = 100.0       // cents -> dollars for display
+	qtyDiv       = 100_000_000 // 1e-8 base units -> whole base coin for display
+	offsetMean   = 50          // mean maker distance from mid, in ticks ($0.50)
+	offsetCapTk  = 2000        // cap maker distance at $20.00
+	seedDepthTks = 300         // initial ladder spans ±$3.00 around mid
 )
+
+// Real-world starting mids (in cents): BTC ~ $108,000, ETH ~ $4,000, SOL ~ $200.
+var marketMid = map[types.MarketID]types.Price{
+	0: 10_800_000,
+	1: 400_000,
+	2: 20_000,
+}
 
 func main() {
 	tps := flag.Int("tps", 100_000, "target throughput (commands/second)")
@@ -59,7 +67,7 @@ func main() {
 		specs[m] = balance.MarketSpec{Base: base, Quote: usdt}
 	}
 	eng := market.NewEngine(market.Config{
-		Markets: specs, QtyScale: 1, FeeScale: 100, MakerFee: 1, TakerFee: 2,
+		Markets: specs, QtyScale: qtyDiv, FeeScale: 100, MakerFee: 1, TakerFee: 2,
 		RingSize: 1 << 16, CapHint: 1 << 20,
 	})
 
@@ -68,24 +76,24 @@ func main() {
 
 	r := rand.New(rand.NewSource(1))
 
-	// Fund the user pool generously.
+	// Fund the user pool generously (USDT in cents, base in 1e-8 units).
 	for a := 1; a <= *users; a++ {
-		eng.Submit(types.Command{Type: types.CmdDeposit, Account: types.AccountID(a), Asset: usdt, Amount: 1 << 50})
+		eng.Submit(types.Command{Type: types.CmdDeposit, Account: types.AccountID(a), Asset: usdt, Amount: 1 << 54})
 		for _, base := range marketBase {
-			eng.Submit(types.Command{Type: types.CmdDeposit, Account: types.AccountID(a), Asset: base, Amount: 1 << 42})
+			eng.Submit(types.Command{Type: types.CmdDeposit, Account: types.AccountID(a), Asset: base, Amount: 1 << 50})
 		}
 	}
 	eng.Drain()
-	// Seed a deep initial ladder around mid so the book looks like a real one
-	// at start: many resting levels on each side stepping away from the touch.
+	// Seed a deep initial ladder around each market's real-world mid so the book
+	// looks like a real one at start: many resting levels stepping from the touch.
 	var id types.OrderID = 1
-	for m := range marketBase {
-		for off := types.Price(1); off <= depthBand; off++ {
-			for k := 0; k < 3; k++ { // a few resting orders per price level
+	for m, mid := range marketMid {
+		for off := types.Price(1); off <= seedDepthTks; off++ {
+			for k := 0; k < 2; k++ { // a couple resting orders per price level
 				id++
-				eng.Submit(order(m, acct(r, *users), id, types.Buy, types.Limit, types.GTC, baseMid-off, types.Qty(1+r.Intn(maxQtyGen))))
+				eng.Submit(order(m, acct(r, *users), id, types.Buy, types.Limit, types.GTC, mid-off, genQty(r)))
 				id++
-				eng.Submit(order(m, acct(r, *users), id, types.Sell, types.Limit, types.GTC, baseMid+off, types.Qty(1+r.Intn(maxQtyGen))))
+				eng.Submit(order(m, acct(r, *users), id, types.Sell, types.Limit, types.GTC, mid+off, genQty(r)))
 			}
 		}
 	}
@@ -143,9 +151,25 @@ func order(m types.MarketID, a types.AccountID, id types.OrderID, side types.Sid
 	return types.Command{Type: types.CmdNewOrder, Market: m, Account: a, OrderID: id, Side: side, OrdType: typ, Tif: tif, Price: price, Qty: qty}
 }
 
+// genQty returns a fractional base-asset size in 1e-8 units: 0.001 .. ~2.0.
+func genQty(r *rand.Rand) types.Qty {
+	return types.Qty((1 + r.Intn(2000)) * 100_000)
+}
+
+// makerOffset returns a maker's tick distance from mid, exponentially
+// distributed so liquidity clusters near the touch and thins out deeper —
+// matching a real crypto book.
+func makerOffset(r *rand.Rand) types.Price {
+	off := 1 + int(r.ExpFloat64()*offsetMean)
+	if off > offsetCapTk {
+		off = offsetCapTk
+	}
+	return types.Price(off)
+}
+
 // midPrice estimates the current mid from the touch, falling back to the last
-// trade or the base mid when a side is empty.
-func midPrice(bk *orderbook.Book) types.Price {
+// trade or the market's base mid when a side is empty.
+func midPrice(bk *orderbook.Book, base types.Price) types.Price {
 	bid, okb := bk.BestBid()
 	ask, oka := bk.BestAsk()
 	switch {
@@ -159,7 +183,7 @@ func midPrice(bk *orderbook.Book) types.Price {
 	if lp, ok := bk.LastPrice(); ok {
 		return lp
 	}
-	return baseMid
+	return base
 }
 
 // genOrder models real order-book dynamics relative to the live mid: most
@@ -170,8 +194,8 @@ func genOrder(eng *market.Engine, r *rand.Rand, id types.OrderID, users int) typ
 	m := marketWeights[r.Intn(len(marketWeights))]
 	a := acct(r, users)
 	side := types.Side(r.Intn(2))
-	qty := types.Qty(1 + r.Intn(maxQtyGen))
-	mid := midPrice(eng.Shard(m).Book())
+	qty := genQty(r)
+	mid := midPrice(eng.Shard(m).Book(), marketMid[m])
 
 	switch n := r.Intn(100); {
 	case n < 8: // cancel a recent order (no-op if already gone)
@@ -185,7 +209,7 @@ func genOrder(eng *market.Engine, r *rand.Rand, id types.OrderID, users int) typ
 		}
 		return order(m, a, id, side, types.Limit, types.IOC, px, qty)
 	default: // maker: rest away from the touch, building the depth ladder
-		off := types.Price(1 + r.Intn(depthBand))
+		off := makerOffset(r)
 		px := mid - off // bid below mid
 		if side == types.Sell {
 			px = mid + off // ask above mid
@@ -273,7 +297,7 @@ func render(f *frame) {
 	// Asks: print worst (highest) at top down to best (lowest) just above the spread.
 	for i := len(f.asks) - 1; i >= 0; i-- {
 		lv := f.asks[i]
-		fmt.Fprintf(&b, "%s  %10s  %6d %s%s\n", red, priceStr(lv.Price), lv.Qty, bar(lv.Qty, maxQty), reset)
+		fmt.Fprintf(&b, "%s  %12s  %10s %s%s\n", red, priceStr(lv.Price), qtyStr(lv.Qty), bar(lv.Qty, maxQty), reset)
 	}
 
 	// Spread / last price band.
@@ -289,7 +313,7 @@ func render(f *frame) {
 
 	// Bids: best (highest) at top down.
 	for _, lv := range f.bids {
-		fmt.Fprintf(&b, "%s  %10s  %6d %s%s\n", green, priceStr(lv.Price), lv.Qty, bar(lv.Qty, maxQty), reset)
+		fmt.Fprintf(&b, "%s  %12s  %10s %s%s\n", green, priceStr(lv.Price), qtyStr(lv.Qty), bar(lv.Qty, maxQty), reset)
 	}
 
 	fmt.Fprintf(&b, "\n%slatency%s  avg %s  p50 %s  p95 %s  p99 %s  max %s\n",
@@ -327,6 +351,10 @@ func maxLevelQty(a, b []orderbook.PriceLevel) types.Qty {
 
 func priceStr(p types.Price) string {
 	return fmt.Sprintf("%.2f", float64(p)/priceDiv)
+}
+
+func qtyStr(q types.Qty) string {
+	return fmt.Sprintf("%.4f", float64(q)/qtyDiv)
 }
 
 func bar(q, max types.Qty) string {
