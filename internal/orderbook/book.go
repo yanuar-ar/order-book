@@ -24,6 +24,7 @@ type orderNode struct {
 	remaining types.Qty // total unfilled quantity (visible + hidden)
 	display   types.Qty // currently visible quantity
 	hidden    types.Qty // reserve quantity for iceberg replenishment
+	peak      types.Qty // iceberg visible-chunk size used when replenishing
 	side      types.Side
 	typ       types.OrderType
 	tif       types.TIF
@@ -136,6 +137,7 @@ func (b *Book) Insert(o NewResting) uint32 {
 		remaining: o.Qty,
 		display:   display,
 		hidden:    o.Qty - display,
+		peak:      display,
 		side:      o.Side,
 		typ:       o.Typ,
 		tif:       o.Tif,
