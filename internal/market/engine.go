@@ -190,6 +190,7 @@ type Engine struct {
 	ingress *spsc.RingCommand
 	impls   map[types.MarketID]*Shard // concrete shards for book access
 	journal sequencer.Journal         // retained so snapshots can force durability
+	cfg     Config                    // retained for the snapshot header (scales, markets)
 }
 
 // Config wires an engine.
@@ -236,10 +237,7 @@ func NewEngine(cfg Config) *Engine {
 		cfg.Clock = counterClock()
 	}
 
-	ledger := balance.New(balance.Config{
-		QtyScale: cfg.QtyScale, FeeScale: cfg.FeeScale,
-		MakerFee: cfg.MakerFee, TakerFee: cfg.TakerFee, Markets: cfg.Markets,
-	})
+	ledger := balance.New(balanceConfig(cfg))
 	impls := make(map[types.MarketID]*Shard, len(cfg.Markets))
 	shards := make(map[types.MarketID]shardOps, len(cfg.Markets))
 	for m := range cfg.Markets {
@@ -265,7 +263,15 @@ func NewEngine(cfg Config) *Engine {
 	for _, s := range impls {
 		s.SetSink(sink)
 	}
-	return &Engine{seq: seq, core: core, ingress: ingress, impls: impls, journal: cfg.Journal}
+	return &Engine{seq: seq, core: core, ingress: ingress, impls: impls, journal: cfg.Journal, cfg: cfg}
+}
+
+// balanceConfig derives the ledger config from the engine config.
+func balanceConfig(cfg Config) balance.Config {
+	return balance.Config{
+		QtyScale: cfg.QtyScale, FeeScale: cfg.FeeScale,
+		MakerFee: cfg.MakerFee, TakerFee: cfg.TakerFee, Markets: cfg.Markets,
+	}
 }
 
 // ApplyJournaled applies a command read from the WAL directly to the core,
