@@ -22,6 +22,13 @@ type Config struct {
 	FeeScale   int64    // fixed-point scale for fee rates
 	MakerFee   int64    // maker fee rate at FeeScale; must be >= 0
 	TakerFee   int64    // taker fee rate at FeeScale; must be >= 0
+
+	// Snapshot durability. Snapshots are a restart-speed optimization layered on
+	// the full WAL; the WAL itself is never truncated in v1.
+	SnapshotPath         string // snapshot directory; distinct from WALPath
+	SnapshotEveryN       int64  // snapshot every N applied commands; 0 disables count-based
+	SnapshotIntervalSecs int64  // snapshot every N seconds; 0 disables time-based
+	SnapshotRetainK      int64  // keep the last K snapshot files; must be >= 1
 }
 
 // Default returns the built-in defaults used when no environment is set.
@@ -35,6 +42,11 @@ func Default() Config {
 		FeeScale:   100_000_000,
 		MakerFee:   0,
 		TakerFee:   0,
+
+		SnapshotPath:         "./data/snapshots",
+		SnapshotEveryN:       0,    // time-based by default
+		SnapshotIntervalSecs: 3600, // every hour
+		SnapshotRetainK:      3,
 	}
 }
 
@@ -71,6 +83,18 @@ func Load(getenv func(string) string) (Config, error) {
 	if c.TakerFee, err = envInt(getenv, "OB_TAKER_FEE", c.TakerFee); err != nil {
 		return Config{}, err
 	}
+	if v := getenv("OB_SNAPSHOT_PATH"); v != "" {
+		c.SnapshotPath = v
+	}
+	if c.SnapshotEveryN, err = envInt(getenv, "OB_SNAPSHOT_EVERY", c.SnapshotEveryN); err != nil {
+		return Config{}, err
+	}
+	if c.SnapshotIntervalSecs, err = envInt(getenv, "OB_SNAPSHOT_INTERVAL", c.SnapshotIntervalSecs); err != nil {
+		return Config{}, err
+	}
+	if c.SnapshotRetainK, err = envInt(getenv, "OB_SNAPSHOT_RETAIN", c.SnapshotRetainK); err != nil {
+		return Config{}, err
+	}
 
 	if err := c.Validate(); err != nil {
 		return Config{}, err
@@ -99,6 +123,21 @@ func (c Config) Validate() error {
 	}
 	if c.MakerFee < 0 || c.TakerFee < 0 {
 		return fmt.Errorf("config: fees must be >= 0 (maker=%d taker=%d)", c.MakerFee, c.TakerFee)
+	}
+	if c.SnapshotPath == "" {
+		return fmt.Errorf("config: OB_SNAPSHOT_PATH must be non-empty")
+	}
+	if c.SnapshotPath == c.WALPath {
+		return fmt.Errorf("config: OB_SNAPSHOT_PATH must differ from OB_WAL_PATH (%q)", c.WALPath)
+	}
+	if c.SnapshotEveryN < 0 || c.SnapshotIntervalSecs < 0 {
+		return fmt.Errorf("config: snapshot cadence must be >= 0 (every=%d interval=%d)", c.SnapshotEveryN, c.SnapshotIntervalSecs)
+	}
+	if c.SnapshotEveryN == 0 && c.SnapshotIntervalSecs == 0 {
+		return fmt.Errorf("config: at least one of OB_SNAPSHOT_EVERY / OB_SNAPSHOT_INTERVAL must be > 0")
+	}
+	if c.SnapshotRetainK < 1 {
+		return fmt.Errorf("config: OB_SNAPSHOT_RETAIN must be >= 1, got %d", c.SnapshotRetainK)
 	}
 	return nil
 }
