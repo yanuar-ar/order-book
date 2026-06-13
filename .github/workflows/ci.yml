@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Lint (gofmt + vet)
+        run: make lint
+      - name: Test
+        run: make test
+      - name: Race
+        run: make race
+      - name: Benchmarks (zero-alloc gate)
+        run: go test -run '^$' -bench . -benchmem ./internal/spsc/ ./internal/matching/ ./internal/balance/
