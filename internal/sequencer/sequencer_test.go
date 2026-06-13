@@ -223,6 +223,136 @@ func TestInjectThenStepSequences(t *testing.T) {
 	}
 }
 
+// syncingJournal records appends and counts fsyncs (it exposes Sync, so the
+// sequencer treats it as a durable journal).
+type syncingJournal struct {
+	recs  []wal.Record
+	syncs int
+}
+
+func (j *syncingJournal) Append(r wal.Record) error { j.recs = append(j.recs, r); return nil }
+func (j *syncingJournal) Sync() error               { j.syncs++; return nil }
+
+func drainSeq(s *Sequencer) {
+	for s.Step() {
+	}
+}
+
+// ---- U2: durable watermark + group-commit flush ----
+
+func TestFlushOnCapAdvancesDurableSeq(t *testing.T) {
+	in := spsc.NewCommand(16)
+	for id := 0; id < 5; id++ {
+		in.Push(cmd(types.OrderID(id)))
+	}
+	j := &syncingJournal{}
+	s := New(Config{Inputs: []*spsc.RingCommand{in}, Journal: j, Router: &fakeRouter{}, Clock: clockSeq(0)})
+	s.setFlushCap(3)
+
+	s.Step() // seq1, unsynced1
+	s.Step() // seq2, unsynced2
+	s.Step() // seq3 -> cap reached -> flush
+	if s.DurableSeq() != 3 {
+		t.Fatalf("durableSeq = %d, want 3 after cap flush", s.DurableSeq())
+	}
+	if j.syncs != 1 {
+		t.Fatalf("syncs = %d, want 1 (one batch fsync)", j.syncs)
+	}
+}
+
+func TestFlushOnRingDrainAdvancesDurableSeq(t *testing.T) {
+	in := spsc.NewCommand(16)
+	in.Push(cmd(1))
+	in.Push(cmd(2))
+	j := &syncingJournal{}
+	s := New(Config{Inputs: []*spsc.RingCommand{in}, Journal: j, Router: &fakeRouter{}, Clock: clockSeq(0)})
+
+	drainSeq(s) // cap=64 not reached; flush fires when the ring drains
+	if s.DurableSeq() != 2 || s.Seq() != 2 {
+		t.Fatalf("durableSeq=%d seq=%d, want both 2", s.DurableSeq(), s.Seq())
+	}
+	if j.syncs != 1 {
+		t.Fatalf("syncs = %d, want 1 (single drain flush)", j.syncs)
+	}
+}
+
+func TestReinjectRecordsAreFlushed(t *testing.T) {
+	// A stop activation sequenced while the external ring is empty must increment
+	// the unsynced count and be flushed before the engine goes idle — its ack
+	// must not be stranded above durableSeq.
+	rein := spsc.NewCommand(16)
+	rein.Push(cmd(900))
+	j := &syncingJournal{}
+	s := New(Config{Reinject: rein, Inputs: nil, Journal: j, Router: &fakeRouter{}, Clock: clockSeq(0)})
+
+	drainSeq(s)
+	if s.DurableSeq() != 1 || s.Seq() != 1 {
+		t.Fatalf("durableSeq=%d seq=%d, want both 1 (reinject flushed)", s.DurableSeq(), s.Seq())
+	}
+	if j.syncs != 1 {
+		t.Fatalf("syncs = %d, want 1", j.syncs)
+	}
+}
+
+func TestNoFsyncWhenIdle(t *testing.T) {
+	j := &syncingJournal{}
+	s := New(Config{Inputs: []*spsc.RingCommand{spsc.NewCommand(16)}, Journal: j, Router: &fakeRouter{}, Clock: clockSeq(0)})
+	if s.Step() {
+		t.Fatal("idle Step should report no work")
+	}
+	if j.syncs != 0 {
+		t.Fatalf("syncs = %d, want 0 (no spurious fsync on an idle engine)", j.syncs)
+	}
+	if s.DurableSeq() != 0 {
+		t.Fatalf("durableSeq = %d, want 0", s.DurableSeq())
+	}
+}
+
+func TestNoopJournalWatermarkTracksSeq(t *testing.T) {
+	// fakeJournal exposes no Sync method; the watermark must still advance so
+	// in-memory-journal engines (property/differential tests) release acks.
+	in := spsc.NewCommand(16)
+	for id := 0; id < 3; id++ {
+		in.Push(cmd(types.OrderID(id)))
+	}
+	s, _, _ := newSeq(t, []*spsc.RingCommand{in}, nil, nil, clockSeq(0))
+	drainSeq(s)
+	if s.DurableSeq() != s.Seq() || s.Seq() != 3 {
+		t.Fatalf("durableSeq=%d seq=%d, want both 3", s.DurableSeq(), s.Seq())
+	}
+}
+
+func TestWalBytesInvariantToFlushCadence(t *testing.T) {
+	// R5: the journaled record stream and Seq assignment must be byte-identical
+	// regardless of flush cadence (flush emits no records and never touches Seq).
+	stream := func() *spsc.RingCommand {
+		in := spsc.NewCommand(64)
+		for id := 0; id < 40; id++ {
+			in.Push(cmd(types.OrderID(id)))
+		}
+		return in
+	}
+	run := func(cap int) []wal.Record {
+		j := &syncingJournal{}
+		s := New(Config{Inputs: []*spsc.RingCommand{stream()}, Journal: j, Router: &fakeRouter{}, Clock: clockSeq(0)})
+		s.setFlushCap(cap)
+		drainSeq(s)
+		if s.DurableSeq() != s.Seq() {
+			t.Fatalf("cap %d: durableSeq=%d != seq=%d after drain", cap, s.DurableSeq(), s.Seq())
+		}
+		return j.recs
+	}
+	a, b := run(1), run(1000)
+	if len(a) != len(b) {
+		t.Fatalf("record counts differ across caps: %d vs %d", len(a), len(b))
+	}
+	for i := range a {
+		if a[i].Seq != b[i].Seq || string(a[i].Payload) != string(b[i].Payload) {
+			t.Fatalf("record %d differs across flush caps: %+v vs %+v", i, a[i], b[i])
+		}
+	}
+}
+
 func recSeqs(recs []wal.Record) []uint64 {
 	out := make([]uint64, len(recs))
 	for i, r := range recs {
