@@ -22,10 +22,20 @@ type openOrder struct {
 	qty     types.Qty
 }
 
+// shardOps is the matching surface Core depends on. The serial engine binds it
+// to a local *Shard (inline matching); the parallel engine binds it to a remote
+// shard that dispatches matching to a worker goroutine. Either way Core drives
+// operations in strict Seq order, so behavior is identical.
+type shardOps interface {
+	Submit(types.FundedOrder) matching.Result
+	Cancel(types.OrderID) bool
+	AmendDown(types.OrderID, types.Qty) bool
+}
+
 // Core implements sequencer.Router: it reserves funds, routes funded orders to
 // shards, settles fills inline, and manages the reservation lifecycle.
 type Core struct {
-	shards map[types.MarketID]*Shard
+	shards map[types.MarketID]shardOps
 	ledger *balance.Ledger
 	open   map[types.OrderID]openOrder
 	acks   []types.Ack // captured for tests/publisher
@@ -171,6 +181,7 @@ type Engine struct {
 	seq     *sequencer.Sequencer
 	core    *Core
 	ingress *spsc.RingCommand
+	impls   map[types.MarketID]*Shard // concrete shards for book access
 }
 
 // Config wires an engine.
@@ -221,9 +232,12 @@ func NewEngine(cfg Config) *Engine {
 		QtyScale: cfg.QtyScale, FeeScale: cfg.FeeScale,
 		MakerFee: cfg.MakerFee, TakerFee: cfg.TakerFee, Markets: cfg.Markets,
 	})
-	shards := make(map[types.MarketID]*Shard, len(cfg.Markets))
+	impls := make(map[types.MarketID]*Shard, len(cfg.Markets))
+	shards := make(map[types.MarketID]shardOps, len(cfg.Markets))
 	for m := range cfg.Markets {
-		shards[m] = NewShard(m, cfg.CapHint)
+		s := NewShard(m, cfg.CapHint)
+		impls[m] = s
+		shards[m] = s
 	}
 	core := &Core{shards: shards, ledger: ledger, open: make(map[types.OrderID]openOrder, 1024)}
 
@@ -240,10 +254,10 @@ func NewEngine(cfg Config) *Engine {
 	if cfg.SuppressStops {
 		sink = noopSink{}
 	}
-	for _, sh := range shards {
-		sh.SetSink(sink)
+	for _, s := range impls {
+		s.SetSink(sink)
 	}
-	return &Engine{seq: seq, core: core, ingress: ingress}
+	return &Engine{seq: seq, core: core, ingress: ingress, impls: impls}
 }
 
 // ApplyJournaled applies a command read from the WAL directly to the core,
@@ -253,7 +267,7 @@ func (e *Engine) ApplyJournaled(cmd types.Command) { e.core.OnCommand(cmd) }
 // EnableStops re-installs the live stop-activation sink, used after a replay
 // (which ran with stops suppressed) to resume normal operation.
 func (e *Engine) EnableStops() {
-	for _, sh := range e.core.shards {
+	for _, sh := range e.impls {
 		sh.SetSink(reinjectSink{seq: e.seq})
 	}
 }
@@ -274,7 +288,7 @@ func (e *Engine) Drain() {
 func (e *Engine) Ledger() *balance.Ledger { return e.core.ledger }
 
 // Shard returns the shard for a market.
-func (e *Engine) Shard(m types.MarketID) *Shard { return e.core.shards[m] }
+func (e *Engine) Shard(m types.MarketID) *Shard { return e.impls[m] }
 
 // MarketIDs returns the engine's market IDs in ascending order.
 func (e *Engine) MarketIDs() []types.MarketID {
