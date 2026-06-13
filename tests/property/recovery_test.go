@@ -14,8 +14,14 @@ import (
 // WAL writer in dir, then closes the writer and returns the engine's canonical
 // state plus the exact net external flow (accounting for any withdrawals).
 func journalStream(t *testing.T, dir string, s Stream) (string, map[types.AssetID]int64) {
+	return journalStreamSeg(t, dir, s, 0)
+}
+
+// journalStreamSeg is journalStream with an explicit WAL segment size, so tests
+// can force multi-segment rollover (segSize <= 0 selects the 1 GiB default).
+func journalStreamSeg(t *testing.T, dir string, s Stream, segSize int64) (string, map[types.AssetID]int64) {
 	t.Helper()
-	w, err := wal.OpenWriter(dir, 0)
+	w, err := wal.OpenWriter(dir, segSize)
 	if err != nil {
 		t.Fatalf("open WAL: %v", err)
 	}
@@ -64,6 +70,29 @@ func TestRecoveryFullReplayEquivalence(t *testing.T) {
 	}
 	if err := CheckAllInvariants(e2, net); err != nil {
 		t.Fatalf("replayed state violates invariants: %v", err)
+	}
+}
+
+// TestRecoveryMultiSegment forces the WAL to roll across many small segments,
+// then replays the whole stream and asserts byte-identical state — exercising
+// segment rollover through the real decode -> ApplyJournaled pipeline (the
+// other recovery tests use a single default-sized segment).
+func TestRecoveryMultiSegment(t *testing.T) {
+	dir := t.TempDir()
+	s := GenSharp(7, 1200)
+	want, net := journalStreamSeg(t, dir, s, 4096) // tiny segments -> dozens of *.wal files
+
+	segs, _ := filepath.Glob(filepath.Join(dir, "*.wal"))
+	if len(segs) < 3 {
+		t.Fatalf("expected multi-segment rollover, got %d segment(s)", len(segs))
+	}
+
+	e2 := replayInto(t, dir)
+	if got := engineState(e2).Canonical(); got != want {
+		t.Fatal("multi-segment replay differs from original")
+	}
+	if err := CheckAllInvariants(e2, net); err != nil {
+		t.Fatalf("multi-segment replay violates invariants: %v", err)
 	}
 }
 
