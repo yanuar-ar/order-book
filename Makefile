@@ -1,4 +1,10 @@
-.PHONY: fmt lint vet test race bench build clean
+.PHONY: fmt lint vet test race bench build loadtest loadtest-quick clean
+
+# Override on the command line, e.g. `make loadtest TPS=200000 DURATION=1m MARKET=1`.
+TPS ?= 100000
+DURATION ?= 2m
+USERS ?= 100
+MARKET ?= 0
 
 # Format check: fail if any file is not gofmt-clean.
 fmt:
@@ -24,6 +30,14 @@ bench:
 
 build:
 	go build -trimpath -o bin/engine ./cmd/engine
+
+# Load test with live order-book TUI (defaults: 100k TPS, 2m, 100 users).
+loadtest:
+	go run ./cmd/loadtest -tps $(TPS) -duration $(DURATION) -users $(USERS) -market $(MARKET)
+
+# Short load test for a quick check (10s).
+loadtest-quick:
+	go run ./cmd/loadtest -tps $(TPS) -duration 10s -users $(USERS) -market $(MARKET)
 
 clean:
 	rm -rf bin
