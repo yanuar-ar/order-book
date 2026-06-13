@@ -33,10 +33,10 @@ func engineConfig() market.Config {
 	return market.Config{Markets: specs, QtyScale: 1, FeeScale: 100, MakerFee: 1, TakerFee: 2, RingSize: 1 << 14, CapHint: 4096}
 }
 
-// genStream deterministically builds a deposit prelude and n random orders for
+// legacyStream deterministically builds a deposit prelude and n random orders for
 // a given seed. Pure function of (seed, n). Deposits and orders are returned
 // separately so callers can apply all deposits before asserting conservation.
-func genStream(seed int64, n int) (deposits, orders []types.Command, deposited map[types.AssetID]int64) {
+func legacyStream(seed int64, n int) (deposits, orders []types.Command, deposited map[types.AssetID]int64) {
 	r := rand.New(rand.NewSource(seed))
 	deposited = map[types.AssetID]int64{}
 
@@ -142,7 +142,7 @@ func TestCheckAllInvariants_DetectsConservationBreak(t *testing.T) {
 // TestRandomLoadHoldsInvariants drives random load, checking invariants
 // incrementally and at the end.
 func TestRandomLoadHoldsInvariants(t *testing.T) {
-	deposits, orders, deposited := genStream(20260613, 3000)
+	deposits, orders, deposited := legacyStream(20260613, 3000)
 	e := market.NewEngine(engineConfig())
 	for _, c := range deposits {
 		e.Submit(c)
@@ -163,7 +163,7 @@ func TestRandomLoadHoldsInvariants(t *testing.T) {
 // TestSameSeedProducesIdenticalState runs the same seed twice and asserts the
 // final canonical state is identical.
 func TestSameSeedProducesIdenticalState(t *testing.T) {
-	deposits, orders, _ := genStream(42, 2000)
+	deposits, orders, _ := legacyStream(42, 2000)
 	all := append(append([]types.Command{}, deposits...), orders...)
 
 	e1 := market.NewEngine(engineConfig())
@@ -230,8 +230,8 @@ func TestTightBudgetMarketLoadConserves(t *testing.T) {
 // TestDifferentSeedsDiverge is a sanity check that the generator and digest are
 // actually sensitive to input (guards against a digest that ignores state).
 func TestDifferentSeedsDiverge(t *testing.T) {
-	d1, o1, _ := genStream(1, 1000)
-	d2, o2, _ := genStream(2, 1000)
+	d1, o1, _ := legacyStream(1, 1000)
+	d2, o2, _ := legacyStream(2, 1000)
 	e1 := market.NewEngine(engineConfig())
 	for _, c := range append(d1, o1...) {
 		e1.Submit(c)
