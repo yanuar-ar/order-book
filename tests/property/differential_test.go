@@ -1,6 +1,10 @@
 package property
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/yanuar-ar/order-book/internal/types"
+)
 
 // TestDifferentialBroad runs the broad uniform generator against the reference
 // model over several seeds: engine and model must agree on canonical state and
@@ -25,6 +29,33 @@ func TestDifferentialSharp(t *testing.T) {
 		t.Run("seed="+itoa(seed), func(t *testing.T) {
 			if err := RunDifferential(GenSharp(seed, 1500)); err != nil {
 				t.Fatalf("seed=%d: %v", seed, err)
+			}
+		})
+	}
+}
+
+// TestDifferentialParallel runs the full sharp/broad streams through the
+// ParallelEngine (matching offloaded to worker goroutines) and asserts it
+// matches the reference model and holds every invariant — covering all eight
+// order types, stops, icebergs, and cancel/amend on the concurrent topology,
+// which the serial-only differential and the thin internal parallel test miss.
+func TestDifferentialParallel(t *testing.T) {
+	cases := []struct {
+		name   string
+		groups [][]types.MarketID
+	}{
+		{"isolated", [][]types.MarketID{{0}, {1}, {2}}},
+		{"shared", [][]types.MarketID{{0}, {1, 2}}},
+		{"default", nil},
+	}
+	for _, gc := range cases {
+		gc := gc
+		t.Run(gc.name, func(t *testing.T) {
+			if err := RunDifferentialParallel(GenSharp(3, 1200), gc.groups); err != nil {
+				t.Fatalf("sharp/%s: %v", gc.name, err)
+			}
+			if err := RunDifferentialParallel(GenBroad(3, 1200), gc.groups); err != nil {
+				t.Fatalf("broad/%s: %v", gc.name, err)
 			}
 		})
 	}

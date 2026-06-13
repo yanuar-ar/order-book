@@ -6,9 +6,19 @@ package property
 import (
 	"fmt"
 
+	"github.com/yanuar-ar/order-book/internal/balance"
 	"github.com/yanuar-ar/order-book/internal/market"
 	"github.com/yanuar-ar/order-book/internal/types"
 )
+
+// Inspectable is the read surface shared by *market.Engine and
+// *market.ParallelEngine, so the invariant checker and state reader work
+// against either topology.
+type Inspectable interface {
+	Ledger() *balance.Ledger
+	Shard(types.MarketID) *market.Shard
+	MarketIDs() []types.MarketID
+}
 
 // CheckAllInvariants runs the applicable invariant taxonomy (testing guide §3)
 // against the engine after a command has been fully processed and drained. It
@@ -27,7 +37,7 @@ import (
 //     notional + worst-case taker fee, and a market buy reserves the account's
 //     entire available quote), so the exact, checkable form is the set
 //     bijection here plus Ledger.Verify()'s per-account reservation sum.
-func CheckAllInvariants(e *market.Engine, netDeposits map[types.AssetID]int64) error {
+func CheckAllInvariants(e Inspectable, netDeposits map[types.AssetID]int64) error {
 	led := e.Ledger()
 	if err := led.Verify(); err != nil {
 		return err

@@ -8,9 +8,18 @@ import (
 	"github.com/yanuar-ar/order-book/tests/refmodel"
 )
 
+// Driver is the drive+inspect surface shared by *market.Engine and
+// *market.ParallelEngine, letting the differential loop run against either.
+type Driver interface {
+	Inspectable
+	Submit(types.Command) bool
+	Step() bool
+	Drain()
+}
+
 // engineState reads the engine's canonical state into the refmodel.State shape
 // so it can be compared against the model's Snapshot via Canonical().
-func engineState(e *market.Engine) refmodel.State {
+func engineState(e Inspectable) refmodel.State {
 	bals, fees := e.Ledger().Dump()
 	st := refmodel.State{}
 	for _, b := range bals {
@@ -27,17 +36,30 @@ func engineState(e *market.Engine) refmodel.State {
 	return st
 }
 
-// RunDifferential drives a fresh engine and reference model through the stream,
-// asserting after every order command that their canonical states match and
-// that CheckAllInvariants holds on the engine. It returns an error describing
-// the first divergence or violation, or nil. Decoupled from *testing.T so the
-// fuzz target and state-machine test can reuse it.
+// RunDifferential drives a fresh serial engine and reference model through the
+// stream, asserting after every order command that their canonical states match
+// and that CheckAllInvariants holds. Returns the first divergence/violation or
+// nil. Decoupled from *testing.T so the fuzz target and state-machine test reuse it.
 func RunDifferential(stream Stream) error {
-	e := market.NewEngine(engineCfg())
+	return runDifferential(market.NewEngine(engineCfg()), stream)
+}
+
+// RunDifferentialParallel runs the same check against the ParallelEngine with
+// the given worker grouping, proving the parallel topology matches the oracle
+// (and therefore the serial engine) across every order type.
+func RunDifferentialParallel(stream Stream, groups [][]types.MarketID) error {
+	pe := market.NewParallelEngine(engineCfg(), groups)
+	defer pe.Close()
+	return runDifferential(pe, stream)
+}
+
+func runDifferential(e Driver, stream Stream) error {
 	mod := refmodel.New(modelCfg())
 
 	apply := func(c types.Command) {
-		e.Submit(c)
+		for !e.Submit(c) { // ingress full (parallel path): drain one and retry
+			e.Step()
+		}
 		e.Drain()
 		mod.Apply(c)
 	}
