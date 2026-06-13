@@ -43,6 +43,60 @@ func run(t *testing.T, e *Engine, cmds ...types.Command) {
 	e.Drain()
 }
 
+// ---- U3: ack-release gate ----
+
+func TestAckGateWithholdsUndurableAcks(t *testing.T) {
+	e := newEng(0, 0, 100, false)
+	cmds := []types.Command{dep(1, usdt, 1000), dep(2, btc, 10), dep(3, usdt, 500)}
+	for _, c := range cmds {
+		if !e.Submit(c) {
+			t.Fatal("ingress full")
+		}
+	}
+	// Step each command without draining. The flush cap is large and the ring is
+	// emptied only by the final pop, so no flush fires mid-loop: durableSeq stays
+	// 0 and every ack is speculative.
+	for range cmds {
+		e.Step()
+	}
+	if e.Seq() != 3 {
+		t.Fatalf("Seq = %d after stepping 3 commands, want 3", e.Seq())
+	}
+	if got := len(e.Acks()); got != 0 {
+		t.Fatalf("Acks() = %d before any flush, want 0 (all speculative above durableSeq)", got)
+	}
+	e.Drain() // ring already empty: the drain flush advances the watermark to Seq
+	if got := len(e.Acks()); got != 3 {
+		t.Fatalf("Acks() = %d after Drain, want 3 (all durable)", got)
+	}
+	for _, a := range e.Acks() {
+		if a.Seq > e.Seq() {
+			t.Fatalf("released ack Seq %d exceeds durableSeq", a.Seq)
+		}
+	}
+}
+
+func TestAckGateAppliesToRejections(t *testing.T) {
+	// A rejected order still acks; the rejection ack is gated identically to an
+	// accepted one (rejection moves no balance, so only the gate proves release).
+	e := newEng(0, 0, 100, false)
+	e.Submit(dep(1, usdt, 10))                                 // tiny balance
+	e.Submit(order(m0, 1, 10, types.Buy, types.Limit, 100, 5)) // needs 500, rejected
+	e.Step()
+	e.Step()
+	if got := len(e.Acks()); got != 0 {
+		t.Fatalf("Acks() = %d before flush, want 0 (rejection ack also gated)", got)
+	}
+	e.Drain()
+	acks := e.Acks()
+	if len(acks) != 2 {
+		t.Fatalf("Acks() = %d after Drain, want 2 (deposit + rejection)", len(acks))
+	}
+	if acks[1].Status != types.AckRejected {
+		t.Fatalf("order ack status = %v, want AckRejected", acks[1].Status)
+	}
+}
+
 // ---- Positive ----
 
 func TestEndToEndDepositMatchSettle(t *testing.T) {

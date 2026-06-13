@@ -341,8 +341,23 @@ func (e *Engine) MarketIDs() []types.MarketID {
 	return ids
 }
 
-// Acks returns the acks captured so far.
-func (e *Engine) Acks() []types.Ack { return e.core.acks }
+// Acks returns the durable acks: those at or below the WAL durability watermark.
+// Acks above durableSeq are speculative (their command is matched in-memory but
+// not yet on disk) and must not be observed until a flush makes them durable.
+// After Drain the watermark equals Seq, so every ack is released.
+func (e *Engine) Acks() []types.Ack { return releasedAcks(e.core.acks, e.seq.DurableSeq()) }
+
+// releasedAcks returns the prefix of acks whose Seq is at or below durable. Acks
+// are appended in ascending Seq order (one per command, in route order, with
+// resting-stop commands simply contributing none), so the durable set is a
+// contiguous prefix.
+func releasedAcks(acks []types.Ack, durable types.Seq) []types.Ack {
+	n := 0
+	for n < len(acks) && acks[n].Seq <= durable {
+		n++
+	}
+	return acks[:n]
+}
 
 // Seq returns the last assigned sequence number.
 func (e *Engine) Seq() types.Seq { return e.seq.Seq() }
