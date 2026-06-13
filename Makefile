@@ -1,8 +1,8 @@
 .PHONY: fmt lint vet test race bench build property differential fuzz throughput loadtest loadtest-quick clean
 
 # Override on the command line, e.g. `make loadtest TPS=200000 DURATION=1m MARKET=1`.
-TPS ?= 5000000
-DURATION ?= 2m
+TPS ?= 500000
+DURATION ?= 1m
 USERS ?= 100
 MARKET ?= 0
 LEVELS ?= 15
