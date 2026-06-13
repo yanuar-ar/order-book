@@ -31,12 +31,32 @@ func NewEngine(book *orderbook.Book, sink Sink) *Engine {
 	return &Engine{book: book, sink: sink}
 }
 
+// SetSink replaces the stop-activation sink. Used by engine assembly to wire
+// the sequencer's re-injection entry after both exist, and to install a no-op
+// sink during replay (when activations come from the WAL, not regeneration).
+func (e *Engine) SetSink(s Sink) { e.sink = s }
+
 // Book exposes the underlying book (read access for callers/tests).
 func (e *Engine) Book() *orderbook.Book { return e.book }
+
+// Cancel removes a resting order or a pending stop with the given id.
+func (e *Engine) Cancel(id types.OrderID) bool {
+	if _, _, _, ok := e.book.Cancel(id); ok {
+		return true
+	}
+	for i := range e.stops {
+		if e.stops[i].ord.OrderID == id {
+			e.stops = append(e.stops[:i], e.stops[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
 
 // Result reports the outcome of submitting one order.
 type Result struct {
 	Fills     []types.Fill
+	Filled    []types.OrderID // resting (maker) orders fully consumed and removed
 	Rested    bool
 	RestedQty types.Qty
 	Rejected  bool
@@ -111,7 +131,9 @@ func (e *Engine) matchActive(o types.FundedOrder) Result {
 		matchIdx++
 		remaining -= x
 		e.book.SetLastPrice(front.Price)
-		e.book.ConsumeFront(oppSide, front.Idx, x)
+		if e.book.ConsumeFront(oppSide, front.Idx, x) {
+			res.Filled = append(res.Filled, front.ID)
+		}
 	}
 
 	// Remainder handling by type.
