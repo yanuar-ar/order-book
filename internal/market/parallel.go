@@ -91,7 +91,17 @@ func (w *worker) run(coreIdx int) {
 		var resp wresp
 		switch req.kind {
 		case reqSubmit:
-			resp.result = sh.Submit(req.funded)
+			r := sh.Submit(req.funded)
+			// Copy the engine's reused Fills/Filled buffers: they alias the
+			// worker's matching engine and would be overwritten on its next
+			// Submit before the control path finishes reading the response.
+			if len(r.Fills) > 0 {
+				r.Fills = append([]types.Fill(nil), r.Fills...)
+			}
+			if len(r.Filled) > 0 {
+				r.Filled = append([]types.OrderID(nil), r.Filled...)
+			}
+			resp.result = r
 			resp.acts = w.coll.drain()
 		case reqCancel:
 			resp.ok = sh.Cancel(req.id)

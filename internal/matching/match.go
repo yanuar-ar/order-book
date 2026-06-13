@@ -25,6 +25,13 @@ type Engine struct {
 	sink     Sink
 	qtyScale int64
 	stops    []stopOrder
+
+	// Reusable per-Submit output buffers: the hot path appends into these
+	// instead of allocating fresh slices each call. The returned Result's
+	// Fills/Filled alias them, so the caller must consume the Result before the
+	// next Submit (the serial engine does; the parallel worker copies).
+	fills  []types.Fill
+	filled []types.OrderID
 }
 
 // NewEngine returns an engine over book, emitting stop activations to sink.
@@ -98,6 +105,8 @@ func crosses(aggSide types.Side, aggPrice types.Price, ordType types.OrderType, 
 func (e *Engine) matchActive(o types.FundedOrder) Result {
 	oppSide := o.Side.Opposite()
 	res := Result{}
+	e.fills = e.fills[:0]
+	e.filled = e.filled[:0]
 
 	// Post-Only must not cross; if it would, reject without matching.
 	if o.Flags.Has(types.FlagPostOnly) {
@@ -155,14 +164,17 @@ func (e *Engine) matchActive(o types.FundedOrder) Result {
 			}
 			spentQuote += q
 		}
-		res.Fills = append(res.Fills, e.buildFill(o, front, x, matchIdx))
+		e.fills = append(e.fills, e.buildFill(o, front, x, matchIdx))
 		matchIdx++
 		remaining -= x
 		e.book.SetLastPrice(front.Price)
 		if e.book.ConsumeFront(oppSide, front.Idx, x) {
-			res.Filled = append(res.Filled, front.ID)
+			e.filled = append(e.filled, front.ID)
 		}
 	}
+
+	res.Fills = e.fills
+	res.Filled = e.filled
 
 	// Remainder handling by type.
 	switch {

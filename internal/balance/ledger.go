@@ -45,12 +45,13 @@ type reservation struct {
 	side      types.Side
 }
 
-// Ledger is the balance authority.
+// Ledger is the balance authority. Reservations are stored by value (not
+// pointer) so opening an order does not allocate on the hot path.
 type Ledger struct {
 	cfg  Config
 	bal  map[key]Balance
 	fees map[types.AssetID]int64
-	res  map[types.OrderID]*reservation
+	res  map[types.OrderID]reservation
 }
 
 // New returns an empty ledger.
@@ -59,7 +60,7 @@ func New(cfg Config) *Ledger {
 		cfg:  cfg,
 		bal:  make(map[key]Balance, 1024),
 		fees: make(map[types.AssetID]int64),
-		res:  make(map[types.OrderID]*reservation, 1024),
+		res:  make(map[types.OrderID]reservation, 1024),
 	}
 }
 
@@ -136,7 +137,7 @@ func (l *Ledger) Reserve(o types.FundedOrder) (types.RejectReason, bool) {
 			return types.ReasonInsufficientFunds, false
 		}
 		l.move(o.Account, spec.Quote, -cost, cost)
-		l.res[o.OrderID] = &reservation{acct: o.Account, asset: spec.Quote, remaining: cost, side: types.Buy}
+		l.res[o.OrderID] = reservation{acct: o.Account, asset: spec.Quote, remaining: cost, side: types.Buy}
 		return types.ReasonNone, true
 	}
 
@@ -146,7 +147,7 @@ func (l *Ledger) Reserve(o types.FundedOrder) (types.RejectReason, bool) {
 		return types.ReasonInsufficientFunds, false
 	}
 	l.move(o.Account, spec.Base, -need, need)
-	l.res[o.OrderID] = &reservation{acct: o.Account, asset: spec.Base, remaining: need, side: types.Sell}
+	l.res[o.OrderID] = reservation{acct: o.Account, asset: spec.Base, remaining: need, side: types.Sell}
 	return types.ReasonNone, true
 }
 
@@ -168,15 +169,17 @@ func (l *Ledger) Settle(f types.Fill) {
 	// Buyer: reserved quote down by notional+fee, base up by qty.
 	l.move(f.BuyAccount, spec.Quote, 0, -(notional + buyerFee))
 	l.move(f.BuyAccount, spec.Base, int64(f.Qty), 0)
-	if r := l.res[f.BuyOrder]; r != nil {
+	if r, ok := l.res[f.BuyOrder]; ok {
 		r.remaining -= notional + buyerFee
+		l.res[f.BuyOrder] = r
 	}
 
 	// Seller: reserved base down by qty, quote up by proceeds (notional-fee).
 	l.move(f.SellAccount, spec.Base, 0, -int64(f.Qty))
 	l.move(f.SellAccount, spec.Quote, notional-sellerFee, 0)
-	if r := l.res[f.SellOrder]; r != nil {
+	if r, ok := l.res[f.SellOrder]; ok {
 		r.remaining -= int64(f.Qty)
+		l.res[f.SellOrder] = r
 	}
 
 	l.fees[spec.Quote] += buyerFee + sellerFee
@@ -238,6 +241,7 @@ func (l *Ledger) AmendReduce(orderID types.OrderID, side types.Side, price types
 		rel := r.remaining - newReq
 		l.move(r.acct, r.asset, rel, -rel)
 		r.remaining = newReq
+		l.res[orderID] = r
 	}
 	return true
 }
