@@ -95,6 +95,13 @@ func FuzzEngine(f *testing.F) {
 	f.Add([]byte{})
 	f.Add([]byte{2, 1, 0, 0, 1, 100, 5, 0, 2, 1, 1, 0, 3, 100, 5, 0})
 	f.Add(bytes.Repeat([]byte{3, 2, 1, 0, 5, 100, 2, 0}, 12))
+	// Filter-boundary regression seeds (decoded against genFilters: MinQty=2,
+	// MinNotional=200, market lot floor 2). Leading byte 3 takes the new-order
+	// branch [op, mk, ac, sd, ot, pr, q, dq].
+	f.Add([]byte{3, 0, 0, 0, 0, 0, 0, 0}) // limit price90 qty1 -> below MinQty (lot)
+	f.Add([]byte{3, 0, 0, 0, 0, 0, 1, 0}) // limit price90 qty2 -> notional 180 < 200
+	f.Add([]byte{3, 0, 0, 0, 4, 0, 0, 0}) // market qty1 -> below MktMinQty
+	f.Add([]byte{3, 0, 0, 0, 8, 0, 4, 0}) // iceberg qty5 display1 -> display below MinQty
 	f.Fuzz(func(t *testing.T, data []byte) {
 		if len(data) > 4096 {
 			data = data[:4096]

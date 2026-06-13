@@ -163,10 +163,29 @@ func genStream(seed int64, n int, sharp bool) Stream {
 				Side: types.Side(r.Intn(2)), Price: randPrice(), Qty: randQty(),
 			}
 			applyType(&c, r, sharp, randPrice)
+			injectOffGrid(&c, r)
 			orders = append(orders, c)
 		}
 	}
 	return Stream{Deposits: deposits, Orders: orders, NetDeposits: net}
+}
+
+// injectOffGrid occasionally pushes an order off its market's filter grid
+// (above MaxPrice, above MaxQty, or below MinQty against genFilters) so the
+// price-range and max-bound rejection paths fire under the differential and
+// fuzz harness. The engine and reference model reject these identically.
+func injectOffGrid(c *types.Command, r *rand.Rand) {
+	if r.Intn(100) >= 4 {
+		return
+	}
+	switch r.Intn(3) {
+	case 0:
+		c.Price = types.Price(1001 + r.Intn(100)) // above MaxPrice (limit/stop-limit)
+	case 1:
+		c.Qty = types.Qty(1001 + r.Intn(100)) // above MaxQty / MktMaxQty
+	default:
+		c.Qty = 1 // below MinQty / MktMinQty
+	}
 }
 
 // applyType selects an order type/TIF/flags for a new-order command, weighted to

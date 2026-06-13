@@ -66,9 +66,17 @@ money-safety guarantee is enforced — read
   double-spend, int64-max overflow, FOK one-short rollback, post-only exact-touch,
   iceberg replenish priority loss, stop cascades, FIFO stress, cancel oddities,
   empty book).
+- **Order filters** (INV-ARI-07) — per-market CEX-style filters (price
+  tick/min/max, lot step/min/max, a separate market-order lot filter, min/max
+  notional) validated at submit. `internal/types/filters_test.go` and
+  `internal/market/engine_filter_test.go` cover positive/negative/edge per order
+  type; the differential harness mirrors the logic in `refmodel` via the shared
+  `genFilters()` source and `CheckAllInvariants` asserts every resting order is
+  on-grid after each command (`invariants_filter_test.go`,
+  `filter_differential_test.go`, filter-boundary fuzz seeds).
 
-Out of scope (no feature in v1): tick/lot rejection (INV-ARI-07), ClientReqID
-idempotency (INV-IDM), amend-up/reprice priority (INV-AMD-02).
+Out of scope (no feature in v1): ClientReqID idempotency (INV-IDM),
+amend-up/reprice priority (INV-AMD-02).
 
 ## Running
 
