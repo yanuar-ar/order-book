@@ -22,3 +22,8 @@ jobs:
         run: make race
       - name: Benchmarks (zero-alloc gate)
         run: go test -run '^$' -bench . -benchmem ./internal/spsc/ ./internal/matching/ ./internal/balance/
+      - name: Fuzz (short gate)
+        # The differential loop, rapid state machine, and adversarial corpus run
+        # under `make test` above. This adds a short coverage-guided fuzz slice
+        # so each PR explores fresh inputs; the nightly workflow runs it long.
+        run: go test -run '^$' -fuzz '^FuzzEngine$' -fuzztime=30s ./tests/property/
