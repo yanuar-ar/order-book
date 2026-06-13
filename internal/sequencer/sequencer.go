@@ -45,7 +45,29 @@ type Sequencer struct {
 
 	seq types.Seq
 	rr  int // round-robin cursor over inputs
+
+	// Durable-ack barrier (output-side only — never journaled, never affects Seq,
+	// timestamps, or fill order, so replay is byte-identical regardless of cadence):
+	//   durableSeq is the highest Seq whose WAL bytes have been fsynced.
+	//   unsynced counts records appended since the last flush.
+	//   flushCap is the group-commit batch ceiling (see defaultFlushCap).
+	durableSeq types.Seq
+	unsynced   int
+	flushCap   int
+
+	// fatal latches a terminal WAL-durability failure. Once set, Step is a no-op
+	// and Run exits: the WAL is the source of truth, so the engine must not
+	// match or release any further output once journaling is broken. No pending
+	// ack is released after a fatal latches. Surfaced to the host via Fatal().
+	fatal error
 }
+
+// defaultFlushCap is the group-commit batch ceiling: a flush fires at the latest
+// when this many records have been appended since the last fsync. It is an
+// unexported constant, not a config knob — the benchmark-driven value (and any
+// promotion to Config) is deferred follow-up work. Tests override it via
+// setFlushCap.
+const defaultFlushCap = 64
 
 // Config wires a sequencer.
 type Config struct {
@@ -66,11 +88,25 @@ func New(cfg Config) *Sequencer {
 		journal:  cfg.Journal,
 		router:   cfg.Router,
 		clock:    cfg.Clock,
+		flushCap: defaultFlushCap,
 	}
 }
 
 // Seq returns the last assigned sequence number.
 func (s *Sequencer) Seq() types.Seq { return s.seq }
+
+// DurableSeq returns the highest Seq whose WAL bytes have been fsynced. Output
+// (acks) at or below this watermark is safe to release; above it is speculative.
+func (s *Sequencer) DurableSeq() types.Seq { return s.durableSeq }
+
+// setFlushCap overrides the group-commit batch ceiling. Test-only seam (used to
+// prove the WAL byte stream and Seq assignment are invariant to flush cadence).
+func (s *Sequencer) setFlushCap(n int) {
+	if n < 1 {
+		n = 1
+	}
+	s.flushCap = n
+}
 
 // SetSeq primes the counter to the given watermark. It is used by snapshot
 // restore so commands sequenced after a restore continue contiguously from the
@@ -92,30 +128,91 @@ func (s *Sequencer) Inject(c types.Command) bool {
 //  2. drain all pending stop activations (priority), sequencing each;
 //  3. sequence one external command (round-robin).
 //
-// It reports whether any work was done.
+// It reports whether any work was done. Once a fatal WAL-durability failure has
+// latched, Step is a no-op and reports no work; the caller surfaces it via
+// Fatal().
 func (s *Sequencer) Step() bool {
+	if s.fatal != nil {
+		return false
+	}
 	did := s.drainFills()
 	if s.reinject != nil {
 		var c types.Command
 		for s.reinject.Pop(&c) {
-			s.sequenceAndRoute(&c)
+			if err := s.sequenceAndRoute(&c); err != nil {
+				s.fatal = err
+				return did
+			}
+			s.unsynced++
 			did = true
 		}
 	}
 	if c, ok := s.pollExternal(); ok {
-		s.sequenceAndRoute(&c)
+		if err := s.sequenceAndRoute(&c); err != nil {
+			s.fatal = err
+			return did
+		}
+		s.unsynced++
+		did = true
+	} else if s.unsynced > 0 {
+		// Input ring drained with records pending: flush so their acks become
+		// durable before the engine goes idle (low latency at light load).
+		if err := s.flush(); err != nil {
+			s.fatal = err
+			return did
+		}
+		did = true
+	}
+	if s.unsynced > 0 && s.unsynced >= s.flushCap {
+		// Batch ceiling reached under load: amortize the fsync (the LMAX
+		// batching effect). flush() zeroes unsynced, so this fires at most once.
+		if err := s.flush(); err != nil {
+			s.fatal = err
+			return did
+		}
 		did = true
 	}
 	return did
 }
 
-// Run loops Step until stop is closed (busy-spin). Used by the assembled engine.
+// flush forces WAL durability and advances the watermark. It captures the
+// last-appended Seq before Sync so the watermark never over-claims coverage the
+// fsync did not include. journalSync reports success for the no-op in-memory
+// journal, which still advances the watermark (nothing to fsync).
+func (s *Sequencer) flush() error {
+	last := s.seq
+	if err := s.journalSync(); err != nil {
+		return err
+	}
+	s.durableSeq = last
+	s.unsynced = 0
+	return nil
+}
+
+// journalSync fsyncs the journal when it supports it; the no-op in-memory
+// journal (tests, replay) exposes no Sync method and reports success.
+func (s *Sequencer) journalSync() error {
+	if sj, ok := s.journal.(interface{ Sync() error }); ok {
+		return sj.Sync()
+	}
+	return nil
+}
+
+// Fatal returns the latched terminal WAL-durability failure, or nil. The host
+// run loop checks this after each Step and halts on a non-nil result.
+func (s *Sequencer) Fatal() error { return s.fatal }
+
+// Run loops Step until stop is closed or a fatal latches (busy-spin). Used by
+// the assembled engine.
 func (s *Sequencer) Run(stop <-chan struct{}) {
 	for {
 		select {
 		case <-stop:
 			return
 		default:
+			if s.fatal != nil {
+				return
+			}
 			s.Step()
 		}
 	}
@@ -157,15 +254,21 @@ func (s *Sequencer) pollExternal() (types.Command, bool) {
 	return types.Command{}, false
 }
 
-func (s *Sequencer) sequenceAndRoute(c *types.Command) {
+// sequenceAndRoute assigns the next Seq + timestamp, journals the command, and
+// routes it. A journal failure is returned without routing — so no ack is
+// produced for an undurable command — and the caller latches it as fatal.
+func (s *Sequencer) sequenceAndRoute(c *types.Command) error {
 	s.seq++
 	c.Seq = s.seq
 	c.TsNanos = s.clock() // wall-clock read happens only here
-	_ = s.journal.Append(wal.Record{
+	if err := s.journal.Append(wal.Record{
 		Seq:     uint64(s.seq),
 		TsNanos: c.TsNanos,
 		Type:    uint16(c.Type),
 		Payload: types.EncodeCommand(*c),
-	})
+	}); err != nil {
+		return err
+	}
 	s.router.OnCommand(*c)
+	return nil
 }

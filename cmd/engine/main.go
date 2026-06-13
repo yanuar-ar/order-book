@@ -87,6 +87,13 @@ func main() {
 				return
 			default:
 				worked := eng.Step()
+				if err := eng.Fatal(); err != nil {
+					// WAL durability failed: the log is the source of truth, so we
+					// must not match or release further output. Halt the loop and
+					// fall through to graceful shutdown.
+					log.Error("engine fail-stop: WAL durability failure", slog.Any("err", err))
+					return
+				}
 				if _, err := snap.Maybe(eng, int64(eng.Seq())); err != nil {
 					log.Error("snapshot failed", slog.Any("err", err))
 				}

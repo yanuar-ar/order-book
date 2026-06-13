@@ -191,9 +191,16 @@ func TestRecoveryDeterminismViaReplay(t *testing.T) {
 		ord(mBTC, 3, 400, types.Buy, types.Limit, types.GTC, 106, 1), // trades @106 -> triggers stop
 	}
 	run(eA, stream1...)
-	if err := w.Close(); err != nil {
-		t.Fatalf("wal close: %v", err)
-	}
+	// Keep the WAL open through the follow-on guard below: it drives more commands
+	// into eA, and a closed journal now (correctly) fail-stops the engine on the
+	// failed append. Replay reads the segment files from the page cache without a
+	// close. The finalized/closed-WAL recovery path is covered separately
+	// (recover_test.go, recovery_test.go).
+	defer func() {
+		if err := w.Close(); err != nil {
+			t.Fatalf("wal close: %v", err)
+		}
+	}()
 	digestA := digest(eA)
 
 	// Replay into a fresh engine with stops suppressed (activations are in the WAL).

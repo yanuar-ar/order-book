@@ -81,6 +81,11 @@ func (s *Snapshotter) Maybe(e *Engine, applied int64) (bool, error) {
 // through the watermark before the atomic rename.
 func (s *Snapshotter) Snapshot(e *Engine, applied int64) error {
 	e.Drain()
+	if err := e.Fatal(); err != nil {
+		// A fail-stop during the drain means the WAL is broken; abort rather than
+		// publish a snapshot that could capture state the log cannot back.
+		return err
+	}
 	path := filepath.Join(s.dir, fmt.Sprintf("%020d%s", uint64(e.Seq()), snapshotExt))
 	if err := e.Snapshot(path); err != nil {
 		return err
