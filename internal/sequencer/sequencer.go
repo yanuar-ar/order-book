@@ -72,6 +72,12 @@ func New(cfg Config) *Sequencer {
 // Seq returns the last assigned sequence number.
 func (s *Sequencer) Seq() types.Seq { return s.seq }
 
+// SetSeq primes the counter to the given watermark. It is used by snapshot
+// restore so commands sequenced after a restore continue contiguously from the
+// snapshot's Seq. It must only be called while the engine is quiesced (before
+// live stepping resumes); it does not journal or route anything.
+func (s *Sequencer) SetSeq(seq types.Seq) { s.seq = seq }
+
 // Inject enqueues a synthetic command (a stop activation) for sequencing. It is
 // called by market shards; returns false if the re-injection ring is full.
 func (s *Sequencer) Inject(c types.Command) bool {

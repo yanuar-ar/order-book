@@ -189,6 +189,7 @@ type Engine struct {
 	core    *Core
 	ingress *spsc.RingCommand
 	impls   map[types.MarketID]*Shard // concrete shards for book access
+	journal sequencer.Journal         // retained so snapshots can force durability
 }
 
 // Config wires an engine.
@@ -264,7 +265,7 @@ func NewEngine(cfg Config) *Engine {
 	for _, s := range impls {
 		s.SetSink(sink)
 	}
-	return &Engine{seq: seq, core: core, ingress: ingress, impls: impls}
+	return &Engine{seq: seq, core: core, ingress: ingress, impls: impls, journal: cfg.Journal}
 }
 
 // ApplyJournaled applies a command read from the WAL directly to the core,
@@ -312,3 +313,18 @@ func (e *Engine) Acks() []types.Ack { return e.core.acks }
 
 // Seq returns the last assigned sequence number.
 func (e *Engine) Seq() types.Seq { return e.seq.Seq() }
+
+// SetSeq primes the sequencer watermark. Used by snapshot restore (before live
+// stepping resumes) so post-restore commands continue contiguously.
+func (e *Engine) SetSeq(s types.Seq) { e.seq.SetSeq(s) }
+
+// SyncJournal forces durability of journaled records through the current Seq,
+// when the journal supports it. A snapshot must be published only after the WAL
+// is durable through its watermark; the in-memory no-op journal has nothing to
+// flush and reports success.
+func (e *Engine) SyncJournal() error {
+	if s, ok := e.journal.(interface{ Sync() error }); ok {
+		return s.Sync()
+	}
+	return nil
+}

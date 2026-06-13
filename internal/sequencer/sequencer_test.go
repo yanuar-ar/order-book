@@ -182,3 +182,42 @@ func recSeqs(recs []wal.Record) []uint64 {
 	}
 	return out
 }
+
+// ---- SetSeq (snapshot restore watermark priming) ----
+
+func TestSetSeqPrimesWatermarkAndContinuesContiguously(t *testing.T) {
+	in := spsc.NewCommand(16)
+	s, _, r := newSeq(t, []*spsc.RingCommand{in}, nil, nil, clockSeq(0))
+
+	// Prime to a mid-stream watermark, as restore would.
+	s.SetSeq(42)
+	if s.Seq() != 42 {
+		t.Fatalf("Seq after SetSeq(42) = %d, want 42", s.Seq())
+	}
+
+	// The next sequenced command must continue at 43, not restart at 1.
+	in.Push(cmd(700))
+	if !s.Step() {
+		t.Fatal("Step should sequence the pushed command")
+	}
+	if s.Seq() != 43 {
+		t.Fatalf("Seq after one step = %d, want 43", s.Seq())
+	}
+	if len(r.cmds) != 1 || r.cmds[0].Seq != 43 {
+		t.Fatalf("post-restore command seq = %+v, want 43", r.cmds)
+	}
+}
+
+func TestSetSeqZeroIsNoOpOnFreshSequencer(t *testing.T) {
+	in := spsc.NewCommand(16)
+	s, _, _ := newSeq(t, []*spsc.RingCommand{in}, nil, nil, clockSeq(0))
+	s.SetSeq(0)
+	if s.Seq() != 0 {
+		t.Fatalf("Seq after SetSeq(0) = %d, want 0", s.Seq())
+	}
+	in.Push(cmd(1))
+	s.Step()
+	if s.Seq() != 1 {
+		t.Fatalf("first command after SetSeq(0) = %d, want 1", s.Seq())
+	}
+}
