@@ -1,5 +1,3 @@
-// Package property runs randomized load against the engine and asserts global
-// invariants hold at every step, plus same-seed determinism.
 package property
 
 import (
@@ -35,10 +33,10 @@ func engineConfig() market.Config {
 	return market.Config{Markets: specs, QtyScale: 1, FeeScale: 100, MakerFee: 1, TakerFee: 2, RingSize: 1 << 14, CapHint: 4096}
 }
 
-// genStream deterministically builds a deposit prelude and n random orders for
+// legacyStream deterministically builds a deposit prelude and n random orders for
 // a given seed. Pure function of (seed, n). Deposits and orders are returned
 // separately so callers can apply all deposits before asserting conservation.
-func genStream(seed int64, n int) (deposits, orders []types.Command, deposited map[types.AssetID]int64) {
+func legacyStream(seed int64, n int) (deposits, orders []types.Command, deposited map[types.AssetID]int64) {
 	r := rand.New(rand.NewSource(seed))
 	deposited = map[types.AssetID]int64{}
 
@@ -93,38 +91,58 @@ func digest(e *market.Engine) string {
 
 func checkInvariants(t *testing.T, e *market.Engine, deposited map[types.AssetID]int64) {
 	t.Helper()
-	bals, fees := e.Ledger().Dump()
-	total := map[types.AssetID]int64{}
-	for _, x := range bals {
-		if x.Available < 0 || x.Reserved < 0 {
-			t.Fatalf("negative balance: acct %d asset %d avail %d reserved %d", x.Acct, x.Asset, x.Available, x.Reserved)
-		}
-		total[x.Asset] += x.Available + x.Reserved
+	if err := CheckAllInvariants(e, deposited); err != nil {
+		t.Fatal(err)
 	}
-	for _, f := range fees {
-		if f.Amount < 0 {
-			t.Fatalf("negative fees asset %d: %d", f.Asset, f.Amount)
+}
+
+// TestCheckAllInvariants_PassesOnHealthyEngine is the positive case: a funded
+// engine with non-crossing resting orders satisfies every invariant.
+func TestCheckAllInvariants_PassesOnHealthyEngine(t *testing.T) {
+	e := market.NewEngine(engineConfig())
+	deposited := map[types.AssetID]int64{}
+	for a := types.AccountID(1); a <= 3; a++ {
+		e.Submit(types.Command{Type: types.CmdDeposit, Account: a, Asset: usdt, Amount: 100_000})
+		deposited[usdt] += 100_000
+		for _, base := range marketBase {
+			e.Submit(types.Command{Type: types.CmdDeposit, Account: a, Asset: base, Amount: 1_000})
+			deposited[base] += 1_000
 		}
-		total[f.Asset] += f.Amount
 	}
-	for asset, want := range deposited {
-		if total[asset] != want {
-			t.Fatalf("asset %d not conserved: total %d, want %d", asset, total[asset], want)
-		}
+	e.Submit(types.Command{Type: types.CmdNewOrder, Market: 0, Account: 1, OrderID: 1, Side: types.Buy, OrdType: types.Limit, Tif: types.GTC, Price: 95, Qty: 2})
+	e.Submit(types.Command{Type: types.CmdNewOrder, Market: 0, Account: 2, OrderID: 2, Side: types.Sell, OrdType: types.Limit, Tif: types.GTC, Price: 105, Qty: 2})
+	e.Drain()
+	if err := CheckAllInvariants(e, deposited); err != nil {
+		t.Fatalf("healthy engine failed CheckAllInvariants: %v", err)
 	}
-	for _, m := range e.MarketIDs() {
-		bid, hb := e.Shard(m).Book().BestBid()
-		ask, ha := e.Shard(m).Book().BestAsk()
-		if hb && ha && bid >= ask {
-			t.Fatalf("market %d crossed: bid %d >= ask %d", m, bid, ask)
-		}
+}
+
+// TestCheckAllInvariants_EmptyEngine is the edge case: nothing deposited or
+// ordered.
+func TestCheckAllInvariants_EmptyEngine(t *testing.T) {
+	e := market.NewEngine(engineConfig())
+	e.Drain()
+	if err := CheckAllInvariants(e, map[types.AssetID]int64{}); err != nil {
+		t.Fatalf("empty engine failed CheckAllInvariants: %v", err)
+	}
+}
+
+// TestCheckAllInvariants_DetectsConservationBreak is the negative case: a
+// netDeposits total that disagrees with ledger state trips INV-BAL-04.
+func TestCheckAllInvariants_DetectsConservationBreak(t *testing.T) {
+	e := market.NewEngine(engineConfig())
+	e.Submit(types.Command{Type: types.CmdDeposit, Account: 1, Asset: usdt, Amount: 1000})
+	e.Drain()
+	err := CheckAllInvariants(e, map[types.AssetID]int64{usdt: 999})
+	if err == nil || !strings.Contains(err.Error(), "INV-BAL-04") {
+		t.Fatalf("expected INV-BAL-04, got %v", err)
 	}
 }
 
 // TestRandomLoadHoldsInvariants drives random load, checking invariants
 // incrementally and at the end.
 func TestRandomLoadHoldsInvariants(t *testing.T) {
-	deposits, orders, deposited := genStream(20260613, 3000)
+	deposits, orders, deposited := legacyStream(20260613, 3000)
 	e := market.NewEngine(engineConfig())
 	for _, c := range deposits {
 		e.Submit(c)
@@ -145,7 +163,7 @@ func TestRandomLoadHoldsInvariants(t *testing.T) {
 // TestSameSeedProducesIdenticalState runs the same seed twice and asserts the
 // final canonical state is identical.
 func TestSameSeedProducesIdenticalState(t *testing.T) {
-	deposits, orders, _ := genStream(42, 2000)
+	deposits, orders, _ := legacyStream(42, 2000)
 	all := append(append([]types.Command{}, deposits...), orders...)
 
 	e1 := market.NewEngine(engineConfig())
@@ -212,8 +230,8 @@ func TestTightBudgetMarketLoadConserves(t *testing.T) {
 // TestDifferentSeedsDiverge is a sanity check that the generator and digest are
 // actually sensitive to input (guards against a digest that ignores state).
 func TestDifferentSeedsDiverge(t *testing.T) {
-	d1, o1, _ := genStream(1, 1000)
-	d2, o2, _ := genStream(2, 1000)
+	d1, o1, _ := legacyStream(1, 1000)
+	d2, o2, _ := legacyStream(2, 1000)
 	e1 := market.NewEngine(engineConfig())
 	for _, c := range append(d1, o1...) {
 		e1.Submit(c)

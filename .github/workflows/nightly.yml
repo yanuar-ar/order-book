@@ -1,0 +1,32 @@
+name: Nightly fuzz & soak
+
+# Long-running correctness sweep. Runs on a schedule (and on demand), separate
+# from CI so it never blocks PRs — its findings are reported via the run status.
+on:
+  schedule:
+    - cron: "0 3 * * *" # 03:00 UTC daily
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Long fuzz (FuzzEngine)
+        run: go test -run '^$' -fuzz '^FuzzEngine$' -fuzztime=30m ./tests/property/
+      - name: Soak (differential + state machine, repeated)
+        # Re-run the property suite many times with the race detector to surface
+        # rare orderings the short PR run would miss.
+        run: go test -race -count=20 ./tests/property/
+      - name: Upload fuzz corpus on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-failure-corpus
+          path: tests/property/testdata/fuzz/
+          if-no-files-found: ignore

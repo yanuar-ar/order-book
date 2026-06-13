@@ -44,3 +44,7 @@ func (s *Shard) AmendDown(id types.OrderID, newQty types.Qty) bool {
 
 // Book exposes the shard's book (read access for invariants/tests).
 func (s *Shard) Book() *orderbook.Book { return s.engine.Book() }
+
+// StopDump exposes the shard's pending stop orders (read access for
+// invariants/tests).
+func (s *Shard) StopDump() []matching.StopView { return s.engine.StopDump() }

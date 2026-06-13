@@ -84,3 +84,58 @@ func TestFeeRoundsUpForReservation(t *testing.T) {
 		t.Fatalf("fee rounding: down=%d up=%d, want 0/1", down, up)
 	}
 }
+
+// TestReservationNeverUnderCoversSettlement is the INV-ARI-02/03 relationship
+// across a range of inexact inputs: for every (price, qty, rate), the
+// reservation (notional+fee, both ceil) is >= the settlement (notional+fee,
+// both floor). A buyer's lock can never under-cover the eventual debit.
+func TestReservationNeverUnderCoversSettlement(t *testing.T) {
+	const scale = int64(100_000_000)
+	prices := []Price{1, 150_000_001, 333_333_333, 999_999_999}
+	qtys := []Qty{1, 100_000_000, 250_000_001, 7_777_777}
+	rates := []int64{0, 1, 10_000, 1_500_000} // 0, 1e-8, 0.0001, 0.015
+	for _, p := range prices {
+		for _, q := range qtys {
+			nSettle, ok1 := Notional(p, q, scale, false)
+			nReserve, ok2 := Notional(p, q, scale, true)
+			if !ok1 || !ok2 {
+				t.Fatalf("notional overflow p=%d q=%d", p, q)
+			}
+			if nReserve < nSettle {
+				t.Fatalf("notional reserve %d < settle %d (p=%d q=%d)", nReserve, nSettle, p, q)
+			}
+			for _, rate := range rates {
+				fSettle, _ := Fee(nSettle, rate, scale, false)
+				fReserve, _ := Fee(nReserve, rate, scale, true)
+				if nReserve+fReserve < nSettle+fSettle {
+					t.Fatalf("reserve %d under-covers settle %d (p=%d q=%d rate=%d)",
+						nReserve+fReserve, nSettle+fSettle, p, q, rate)
+				}
+			}
+		}
+	}
+}
+
+// TestNotionalOverflowNearInt64Max is the INV-ARI-01 edge: a price*qty whose
+// scaled quotient still overflows int64 must report ok=false, never wrap.
+func TestNotionalOverflowNearInt64Max(t *testing.T) {
+	// price*qty/scale = MaxInt64*MaxInt64/1 -> quotient far exceeds int64.
+	if v, ok := Notional(Price(math.MaxInt64), Qty(math.MaxInt64), 1, true); ok {
+		t.Fatalf("expected overflow ok=false, got (%d,true)", v)
+	}
+	// A large-but-fitting case still succeeds (scale brings it back in range).
+	if _, ok := Notional(Price(1<<60), Qty(1<<60), math.MaxInt64, false); !ok {
+		t.Fatal("expected in-range result to succeed")
+	}
+}
+
+// TestFeeZeroRateAndNegative covers the fee edges: a zero rate yields zero fee,
+// and negative inputs are rejected (ok=false) rather than wrapping.
+func TestFeeZeroRateAndNegative(t *testing.T) {
+	if f, ok := Fee(1000, 0, 100_000_000, true); !ok || f != 0 {
+		t.Fatalf("zero-rate fee = (%d,%v), want (0,true)", f, ok)
+	}
+	if _, ok := Fee(-1000, 1, 100_000_000, false); ok {
+		t.Error("negative notional should be rejected")
+	}
+}
