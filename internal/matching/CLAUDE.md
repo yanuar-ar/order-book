@@ -12,7 +12,9 @@ plus self-trade prevention.
   does; the parallel worker copies).
 - `stops.go` — Stop / Stop-Limit orders held off-book in a stop table, activated
   by trade-price movement and emitted to the `Sink` as new commands (never an
-  inline closure — keeps the path allocation-free).
+  inline closure — keeps the path allocation-free). Also `StopDump()`/`StopView`,
+  a deterministic (by Seq) read view of pending stops so `tests/property` can
+  include their off-book reservations in INV-BAL-03.
 
 ## Constraints
 

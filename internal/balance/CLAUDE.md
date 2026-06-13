@@ -8,6 +8,9 @@ account. This is the most money-critical package in the engine.
 
 - `ledger.go` — `Ledger`, `Balance{Available, Reserved}`, `Config` (scales, fee
   rates, market specs), `reservation` lifecycle.
+- `verify.go` — `Ledger.Verify()` (INV-BAL-01 + reservation-consistency, the
+  ledger half of INV-BAL-03) and `ReservedOrders()`, which `tests/property` uses
+  to cross-check the reserved-order set against open resting orders + stops.
 - `event.go` — `BalanceEvent`: the single tagged event stream the ledger
   consumes so reservations (in `Seq` order) and settlements (in fill order)
   interleave in one fixed, deterministic order.

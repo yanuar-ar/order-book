@@ -1,50 +1,89 @@
 # tests
 
-Cross-package correctness: end-to-end integration and randomized
-invariant/determinism testing. This is where the engine's money-safety guarantee
-is actually enforced — read `docs/designs/invariant-fuzz-testing-guide.md`.
+Cross-package correctness: end-to-end integration plus the randomized
+invariant / differential / fuzz / recovery harness. This is where the engine's
+money-safety guarantee is enforced — read
+`docs/designs/invariant-fuzz-testing-guide.md` for the invariant taxonomy.
 
 ## Layout
 
-- `integration/` — `engine_test.go` (end-to-end order lifecycles across the
-  assembled engine) and `concurrent_test.go` (parallel topology / ring paths;
+- `integration/` — end-to-end order lifecycles across the assembled engine
+  (`engine_test.go`) and the parallel topology / ring paths (`concurrent_test.go`,
   run under `make race`).
-- `property/` — `invariants_test.go`: builds a deterministic deposit prelude +
-  random order stream from a seed, applies it, and asserts **global invariants
-  hold at every step**, plus same-seed determinism.
-- `fixtures/` — shared test data / regression seeds.
+- `refmodel/` — the **reference model (oracle)**: a slow-but-obviously-correct
+  reimplementation of the engine over plain slices/maps. `model.go` +
+  `model_match.go` implement all eight order types, cancel, amend-down, stops,
+  and self-trade prevention; `state.go` renders a canonical `State` string for
+  comparison; `model_test.go` validates the oracle against hand-written examples.
+  It reuses `internal/types` money helpers so amounts match the engine exactly,
+  but reimplements everything else independently.
+- `property/` — the harness, all in `package property`:
+  - `invariants.go` — `CheckAllInvariants(engine, netDeposits)`, the composite
+    that runs each package's `Verify()` plus the cross-package money/book
+    invariants (INV-BAL-03/04, INV-OB-01). `Inspectable` is the read interface
+    both `*market.Engine` and `*market.ParallelEngine` satisfy.
+  - `generators.go` — `GenBroad` (uniform) and `GenSharp` (adversarial-biased)
+    streams over all order types + cancel/amend/withdraw; the shared
+    market/asset layout and `engineCfg()`/`modelCfg()`.
+  - `differential.go` — `RunDifferential` (serial) and `RunDifferentialParallel`,
+    plus the dynamic net-flow tracking (`applyNet`/`feedTrackingNet`) that keeps
+    conservation exact across withdrawals.
+  - `differential_test.go`, `determinism_test.go`, `recovery_test.go`,
+    `adversarial_test.go`, `statemachine_test.go`, `fuzz_test.go`.
+  - `testdata/fuzz/` — the permanent regression corpus.
+- `fixtures/` — shared test data.
 
-## The three layers of defense (must all exist)
+## The three layers of defense
 
-1. **Unit tests** (in each package) — concrete positive / negative / edge
-   examples per scenario and order type.
-2. **Invariant checks** — `CheckAllInvariants(state)` runs the full `INV-*`
-   taxonomy (guide §3) **after every command**; returns the first violation with
-   context.
-3. **Differential model (oracle)** — a slow-but-obviously-correct reference
-   model run on the identical command stream; assert output + state match at
-   every step. This is the only thing that catches "wrong answer, tidy state".
+1. **Unit tests** (in each engine package) — positive / negative / edge per
+   scenario and order type.
+2. **Invariant checks** — `CheckAllInvariants` runs the applicable `INV-*`
+   taxonomy **after every command** and returns the first violation with context.
+3. **Differential model (oracle)** — `refmodel` run on the identical stream;
+   canonical state must match at every step. This is what catches "wrong answer,
+   tidy state".
 
-## Required tests here
+## What's covered
 
-- **Differential loop** (guide §4.2): engine vs reference model, identical
-  random stream, compare events + state + `CheckAllInvariants` each step.
-- **Go native fuzz** (`go test -fuzz=FuzzEngine`): coverage-guided byte mutation
-  over serialized command streams.
-- **Stateful property** (`pgregory.net/rapid`): state-machine with automatic
-  shrinking to a minimal reproducer.
-- **Determinism** (`INV-DET-01`): two runs of the same seed → byte-identical
-  state. **Recovery** (`INV-DET-02/03`): snapshot + replay == full replay, and
-  torn-tail recovery still satisfies all invariants.
-- **Adversarial seeds** (guide §6): every listed edge has an explicit seed
-  (exact-fit balance, FOK one-unit-short, overflow neighborhood, off-tick/lot,
-  immediate-trigger stops, cross-market reuse, duplicate `ClientReqID`).
+- **Differential loop** — engine vs `refmodel`, broad + sharp generators, serial
+  AND parallel (`RunDifferentialParallel`, isolated/shared/default groupings),
+  `CheckAllInvariants` each step.
+- **Go native fuzz** — `FuzzEngine` decodes bytes → command stream → differential
+  loop.
+- **Stateful property** — `TestEngineStateMachine` via `pgregory.net/rapid`
+  (test-only dep) with automatic shrinking.
+- **Determinism** — same-seed byte-identical state (INV-DET-01); fill order by
+  `(AggressorSeq, MatchIndex)` (INV-DET-04/INV-MAT-08).
+- **Recovery** — full WAL replay equivalence (INV-DET-01), multi-segment
+  rollover, torn-tail clean stop (INV-DET-03), metamorphic cancel-all /
+  batch-invariance (INV-MET-01/02/04). Mid-stream snapshot equivalence
+  (INV-DET-02) is deferred — needs an engine snapshot/restore API.
+- **Adversarial seeds** (guide §6) — `adversarial_test.go` has an explicit
+  scenario per row (exact-fit / one-short / joint-over balance, cross-market
+  double-spend, int64-max overflow, FOK one-short rollback, post-only exact-touch,
+  iceberg replenish priority loss, stop cascades, FIFO stress, cancel oddities,
+  empty book).
+
+Out of scope (no feature in v1): tick/lot rejection (INV-ARI-07), ClientReqID
+idempotency (INV-IDM), amend-up/reprice priority (INV-AMD-02).
+
+## Running
+
+```bash
+make property      # full differential + invariants + determinism + recovery + rapid
+make differential  # just the engine-vs-model differential checks (verbose)
+make fuzz          # coverage-guided fuzz; FUZZTIME=5m to extend
+make test          # everything (go test ./...), includes the above Test* funcs
+make race          # parallel + ring paths under the race detector
+```
 
 ## Rules
 
-- Every failing seed found by fuzzing is saved permanently under
-  `testdata/fuzz/` — **regression seeds are never deleted**.
-- Generators must be deterministic: seeded PRNG only, no wall-clock, no `map`
-  iteration order leaking into command order. Log the seed on every run.
-- Validate the reference model itself against hand-written examples so a buggy
-  oracle can't mask an engine bug.
+- Failing fuzz inputs are saved permanently under `property/testdata/fuzz/` —
+  **regression seeds are never deleted**.
+- Generators are pure functions of a seed: seeded PRNG only, no wall-clock, no
+  `map`-iteration order leaking into command order.
+- Conservation baselines are tracked dynamically (`feedTrackingNet`) for any
+  stream containing withdrawals — never assume deposits == net flow.
+- Validate the oracle against hand-written examples (`refmodel/model_test.go`)
+  so a buggy oracle can't mask an engine bug.

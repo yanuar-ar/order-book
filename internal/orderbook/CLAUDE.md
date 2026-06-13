@@ -26,6 +26,11 @@ lists per price level**. Cancelled slots recycle through a free-list.
 
 ## Testing (positive / negative / edge + invariant)
 
+`Book.Verify()` (`verify.go`) implements the structural invariants below and
+returns the first violation with context; `tests/property` composes it into
+`CheckAllInvariants` and runs it after every command. `verify_test.go` exercises
+it positive/negative/edge by injecting one corruption per invariant.
+
 `book_test.go`, `dump_test.go` exist. Assert the structural invariants
 (`docs/designs/invariant-fuzz-testing-guide.md §3.C`) after every mutation:
 - `INV-OB-03` FIFO list integrity (head.prev/tail.next == Nil, links reciprocal,

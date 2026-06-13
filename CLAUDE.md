@@ -81,16 +81,23 @@ Follow the checklist in `docs/designs/invariant-fuzz-testing-guide.md §7`.
 ## Build & verify
 
 ```bash
-make lint   # gofmt check + go vet  (run before every commit)
-make test   # unit + integration tests
-make race   # race detector on concurrency packages
-make bench  # benchmarks with -benchmem (watch the alloc count)
-make build  # build ./cmd/engine into bin/
+make lint         # gofmt check + go vet  (run before every commit)
+make test         # unit + integration + property/differential tests
+make race         # race detector on concurrency packages
+make bench        # benchmarks with -benchmem (watch the alloc count)
+make build        # build ./cmd/engine into bin/
+make property     # full differential + invariants + determinism + recovery + rapid
+make differential # just the engine-vs-reference-model differential checks
+make fuzz         # coverage-guided native fuzz (FUZZTIME=30s default; FUZZTIME=5m to extend)
 ```
 
-CI (`.github/workflows/ci.yml`) runs lint, test, race, and the zero-alloc
-benchmark gate. Keep all green. Run `make lint test` locally before claiming
-work is done.
+CI (`.github/workflows/ci.yml`) runs lint, test, race, the zero-alloc benchmark
+gate, and a short fuzz slice; `nightly.yml` runs long fuzz + a `-race` soak.
+Keep all green. Run `make lint test` locally before claiming work is done.
+
+The engine itself is **zero-dependency**; the only third-party module is
+`pgregory.net/rapid`, imported solely from `tests/property/*_test.go` for the
+state-machine layer, so it never links into `go build ./cmd/engine`.
 
 ## Layout
 
