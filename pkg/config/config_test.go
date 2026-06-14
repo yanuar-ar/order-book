@@ -63,6 +63,41 @@ func TestLoadRejectsNonPowerOfTwoRing(t *testing.T) {
 	}
 }
 
+func TestLoadJournalDefaultsSync(t *testing.T) {
+	c, err := Load(envMap(map[string]string{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.JournalMode != "sync" {
+		t.Fatalf("default JournalMode = %q, want \"sync\"", c.JournalMode)
+	}
+	if c.JournalRing != 0 {
+		t.Fatalf("default JournalRing = %d, want 0", c.JournalRing)
+	}
+}
+
+func TestLoadJournalAsyncOverride(t *testing.T) {
+	c, err := Load(envMap(map[string]string{"OB_JOURNAL_MODE": "async", "OB_JOURNAL_RING": "131072"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.JournalMode != "async" || c.JournalRing != 131072 {
+		t.Fatalf("got mode=%q ring=%d, want async/131072", c.JournalMode, c.JournalRing)
+	}
+}
+
+func TestLoadRejectsBadJournalMode(t *testing.T) {
+	if _, err := Load(envMap(map[string]string{"OB_JOURNAL_MODE": "maybe"})); err == nil {
+		t.Fatal("expected error for invalid OB_JOURNAL_MODE, got nil")
+	}
+}
+
+func TestLoadRejectsNonPowerOfTwoJournalRing(t *testing.T) {
+	if _, err := Load(envMap(map[string]string{"OB_JOURNAL_MODE": "async", "OB_JOURNAL_RING": "1000"})); err == nil {
+		t.Fatal("expected error for non-power-of-two OB_JOURNAL_RING, got nil")
+	}
+}
+
 func TestLoadRejectsMalformedMarket(t *testing.T) {
 	_, err := Load(envMap(map[string]string{"OB_MARKETS": "BTCUSDT"}))
 	if err == nil {

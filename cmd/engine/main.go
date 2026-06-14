@@ -40,14 +40,16 @@ func main() {
 	}
 
 	mcfg := market.Config{
-		Markets:  specs,
-		Filters:  buildMarketFilters(cfg),
-		QtyScale: cfg.QtyScale,
-		FeeScale: cfg.FeeScale,
-		MakerFee: cfg.MakerFee,
-		TakerFee: cfg.TakerFee,
-		RingSize: cfg.RingSize,
-		Journal:  walW,
+		Markets:      specs,
+		Filters:      buildMarketFilters(cfg),
+		QtyScale:     cfg.QtyScale,
+		FeeScale:     cfg.FeeScale,
+		MakerFee:     cfg.MakerFee,
+		TakerFee:     cfg.TakerFee,
+		RingSize:     cfg.RingSize,
+		Journal:      walW,
+		AsyncJournal: cfg.JournalMode == "async",
+		JournalRing:  cfg.JournalRing,
 	}
 	eng, err := market.Recover(mcfg, cfg.WALPath, cfg.SnapshotPath, func(format string, args ...any) {
 		log.Warn("recovery fallback", slog.String("detail", fmt.Sprintf(format, args...)))
@@ -113,6 +115,11 @@ func main() {
 
 	if err := snap.Snapshot(eng, int64(eng.Seq())); err != nil {
 		log.Error("final snapshot failed", slog.Any("err", err))
+	}
+	// Stop the async journaller goroutine (if any) before closing the WAL it
+	// writes to; a no-op for the sync journaller.
+	if err := eng.Close(); err != nil {
+		log.Error("journaller close failed", slog.Any("err", err))
 	}
 	if err := walW.Close(); err != nil {
 		log.Error("WAL close failed", slog.Any("err", err))

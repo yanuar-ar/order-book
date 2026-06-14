@@ -23,6 +23,14 @@ type Config struct {
 	MakerFee   int64    // maker fee rate at FeeScale; must be >= 0
 	TakerFee   int64    // taker fee rate at FeeScale; must be >= 0
 
+	// Journaling. JournalMode is "sync" (inline fsync on the sequencer goroutine,
+	// the default and historical behavior) or "async" (a dedicated journaller
+	// goroutine fsyncs off the matcher for higher durable throughput). JournalRing
+	// sizes the async hand-off ring (power of two, or 0 for the engine default);
+	// it is ignored in sync mode.
+	JournalMode string
+	JournalRing uint64
+
 	// Snapshot durability. Snapshots are a restart-speed optimization layered on
 	// the full WAL; the WAL itself is never truncated in v1.
 	SnapshotPath         string // snapshot directory; distinct from WALPath
@@ -84,6 +92,9 @@ func Default() Config {
 		MakerFee:   0,
 		TakerFee:   0,
 
+		JournalMode: "sync",
+		JournalRing: 0, // engine default
+
 		SnapshotPath:         "./data/snapshots",
 		SnapshotEveryN:       0,    // time-based by default
 		SnapshotIntervalSecs: 3600, // every hour
@@ -142,6 +153,12 @@ func Load(getenv func(string) string) (Config, error) {
 		return Config{}, err
 	}
 	if c.TakerFee, err = envInt(getenv, "OB_TAKER_FEE", c.TakerFee); err != nil {
+		return Config{}, err
+	}
+	if v := getenv("OB_JOURNAL_MODE"); v != "" {
+		c.JournalMode = v
+	}
+	if c.JournalRing, err = envUint(getenv, "OB_JOURNAL_RING", c.JournalRing); err != nil {
 		return Config{}, err
 	}
 	if v := getenv("OB_SNAPSHOT_PATH"); v != "" {
@@ -241,6 +258,12 @@ func (c Config) Validate() error {
 	}
 	if c.RingSize == 0 || c.RingSize&(c.RingSize-1) != 0 {
 		return fmt.Errorf("config: OB_RING_SIZE must be a power of two, got %d", c.RingSize)
+	}
+	if c.JournalMode != "sync" && c.JournalMode != "async" {
+		return fmt.Errorf("config: OB_JOURNAL_MODE must be \"sync\" or \"async\", got %q", c.JournalMode)
+	}
+	if c.JournalRing != 0 && c.JournalRing&(c.JournalRing-1) != 0 {
+		return fmt.Errorf("config: OB_JOURNAL_RING must be a power of two (or 0 for the default), got %d", c.JournalRing)
 	}
 	if c.PriceScale <= 0 || c.QtyScale <= 0 || c.FeeScale <= 0 {
 		return fmt.Errorf("config: scales must be positive (price=%d qty=%d fee=%d)", c.PriceScale, c.QtyScale, c.FeeScale)
