@@ -25,15 +25,20 @@ onward; it also drains market fills and applies settlement in deterministic
   `Fatal()`. Selected by `market.Config.AsyncJournal`.
 - `replicator.go` — the `Replicator` seam (Replicate / Flush / Drain /
   ReplicatedSeq / Fatal / Close), the structural mirror of `Journaller` for the
-  hot-standby stream, and `NopReplicator`, the default for replication `off`
-  (`ReplicatedSeq` is `+inf`, so the ack gate stays `durableSeq`-only). The
+  hot-standby stream; `NopReplicator`, the default for replication `off`
+  (`ReplicatedSeq` is `+inf`, so the ack gate stays `durableSeq`-only); and the
+  `StandbyLink` transport seam (Send / AckedSeq / Fetch / Fatal / Close). The
   sequencer stamps a leadership-term `Epoch` on every command (bumped on
   promotion), calls `Replicate` after the durable `Append` in `sequenceAndRoute`,
   gates output on `ReleaseSeq() = min(durableSeq, replicatedSeq)`, and halts on a
-  replicator fatal. `Replicate` is **non-blocking** (a slow/dead standby stalls
-  acks only, never journaling or matching). The off-thread `AsyncReplicator` and
-  the standby apply/promotion/degrade machinery are the remaining replicator
-  units (see `docs/plans/2026-06-14-007-feat-replicator-hot-standby-plan.md`).
+  replicator fatal.
+- `async_replicator.go` — `AsyncReplicator`: streams to the standby off the
+  sequencer goroutine via a `StandbyLink`, publishing `replicatedSeq` from the
+  link's `AckedSeq`. The one deliberate divergence from `AsyncJournaller`:
+  `Replicate` is **non-blocking** — a full ring drops the command (still durable
+  in the WAL) and the consumer backfills it via `StandbyLink.Fetch`, so a
+  slow/dead standby stalls acks only, never journaling or matching. Selected by
+  `market.Config.ReplicationMode` (`buildReplicator`).
 
 ## Durable-ack barrier
 

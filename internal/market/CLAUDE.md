@@ -50,15 +50,29 @@ sequencer, balance authority, and shards together. Provides both the serial
 
 ## Replication (hot standby)
 
-`Engine.Acks()` / `ParallelEngine.Acks()` gate on
-`Sequencer.ReleaseSeq() = min(durableSeq, replicatedSeq)`, so in sync replication
-mode a command is confirmed only once it is both locally durable and replicated;
-with replication `off` the replicated watermark is `+inf` and the gate collapses
-to `durableSeq` (behavior-neutral). `Config.ReplicationMode`/`ReplicationRing`
-select the replicator. The live `AsyncReplicator`, the in-process `StandbyLink`,
-the standby apply/catch-up path, manual epoch-fenced promotion, and degrade-to-
-solo are tracked in
-`docs/plans/2026-06-14-007-feat-replicator-hot-standby-plan.md` (U4–U10).
+`standby.go` — the hot-standby data plane. `Config.ReplicationMode`
+(`off`/`sync`/`async`) selects it via `buildReplicator` (shared by serial and
+parallel, like `buildJournaller`). The `Standby` is a shadow `Engine` in
+suppress-stops mode (replay posture) that applies the replicated stream via
+`ApplyJournaled` with a duplicate-Seq guard (`ApplyJournaled` is not idempotent);
+the `inProcessLink` drives it and backfills overflow gaps from the primary's
+`WALDir` via `Fetch`. `Acks()` (both topologies, via `releaseGate`) gate on
+`min(durableSeq, replicatedSeq)` in sync mode — a command is confirmed only once
+locally durable AND replicated — collapsing to `durableSeq` when off
+(behavior-neutral) or once a degrade-to-solo is in effect.
+
+- **Promotion** (`Standby.Promote`): increments the leadership term, primes the
+  engine's `Seq`/`Epoch`, re-enables stops, and returns the now-live engine. The
+  apply path fences a stale-epoch (zombie) record — no Seq consumed, no mutation.
+- **Degrade-to-solo / re-arm** (`CmdDegradeToSolo`/`CmdRearm`): flip the ack-gate
+  `degraded` flag (Core state, no-op to book/ledger). Reconstructed on replay and
+  persisted in the snapshot (`secReplication` section); excluded from
+  `StateFingerprint`, so a degraded primary and its standby stay fingerprint-equal.
+- Correctness: `INV-REP-01/02` + `RunDifferentialReplicated` + the chaos suite in
+  `tests/property` prove the standby converges to the primary's fingerprint
+  through all order types and a promoted standby preserves every confirmed order.
+  Network transport behind `StandbyLink` and in-engine old-primary rejoin are
+  deferred (`docs/plans/2026-06-14-007-feat-replicator-hot-standby-plan.md`).
 
 ## Constraints
 

@@ -9,7 +9,9 @@ directly to the WAL and copy through SPSC rings without allocation.
 - `types.go` — scalar IDs (`Price`, `Qty`, `AccountID`, `OrderID`, `MarketID`,
   `Seq`, …) and the wire structs: `Command` (external, journaled), `Fill`,
   `FundedOrder` (post-reservation envelope). Enums: `Side`, `OrderType`, `TIF`,
-  `Flags`, `CmdType`. `Command.Epoch` is the leadership term the sequencer
+  `Flags`, `CmdType` (incl. `CmdDegradeToSolo`/`CmdRearm`, the replication control
+  records that flip the ack-gate mode and are no-ops to state). `Command.Epoch`
+  is the leadership term the sequencer
   stamps (envelope metadata like `Seq`/`TsNanos`): matching never reads it, so it
   does not affect state or the fingerprint — it rides the command (not just the
   WAL record) so it reaches the async journaller/replicator consumers through the
