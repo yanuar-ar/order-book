@@ -1,4 +1,4 @@
-.PHONY: fmt lint vet test race bench build property differential fuzz throughput throughput-sync loadtest loadtest-sync loadtest-quick clean
+.PHONY: fmt lint vet test race bench build property differential fuzz throughput throughput-sync throughput-replicated loadtest loadtest-sync loadtest-replicated loadtest-quick clean
 
 # Override on the command line, e.g. `make loadtest TPS=200000 DURATION=1m MARKET=1`.
 TPS ?= 500000
@@ -13,6 +13,9 @@ TOPOLOGY ?= serial
 CORES ?= 0;1,2
 # Group-commit batch ceiling (commands per fsync) for the durable bench targets.
 FLUSHCAP ?= 8192
+# Replication mode for the bench targets: off (default), sync (hot standby — the
+# production posture), or async. The *-replicated targets pin this to sync.
+REPLICATION ?= off
 # Native-fuzz duration for `make fuzz`. Override, e.g. `make fuzz FUZZTIME=5m`.
 FUZZTIME ?= 30s
 
@@ -59,21 +62,33 @@ fuzz:
 # Both journal durably to a real WAL; `throughput` is **async** (off-thread fsync,
 # the 1M durable path — the default), `throughput-sync` uses the inline journaller.
 # Serial (default) or parallel; for parallel, CORES maps markets->workers.
+# REPLICATION=sync adds an in-process hot standby (or use `make throughput-replicated`).
 # e.g. `make throughput FLUSHCAP=16384`, or `make throughput-sync` to compare.
 throughput:
-	go run ./cmd/throughput -topology $(TOPOLOGY) -cores "$(CORES)" -duration $(DURATION) -users $(USERS) -journal async -flushcap $(FLUSHCAP)
+	go run ./cmd/throughput -topology $(TOPOLOGY) -cores "$(CORES)" -duration $(DURATION) -users $(USERS) -journal async -replication $(REPLICATION) -flushcap $(FLUSHCAP)
 
 throughput-sync:
-	go run ./cmd/throughput -topology $(TOPOLOGY) -cores "$(CORES)" -duration $(DURATION) -users $(USERS) -journal sync -flushcap $(FLUSHCAP)
+	go run ./cmd/throughput -topology $(TOPOLOGY) -cores "$(CORES)" -duration $(DURATION) -users $(USERS) -journal sync -replication $(REPLICATION) -flushcap $(FLUSHCAP)
+
+# Production posture: async durable journal + a sync hot standby (the in-process
+# standby shares cores, so the number is a lower bound vs a real 2-node setup).
+throughput-replicated:
+	go run ./cmd/throughput -topology $(TOPOLOGY) -cores "$(CORES)" -duration $(DURATION) -users $(USERS) -journal async -replication sync -flushcap $(FLUSHCAP)
 
 # "How does it behave at load X": open-loop paced load with a live order-book TUI
 # and two-SLO latency (internal match + durable-ack). `loadtest` is **async**
-# (default), `loadtest-sync` journals inline. e.g. `make loadtest TPS=200000`.
+# (default), `loadtest-sync` journals inline. REPLICATION=sync makes the ack SLO
+# durable+replicated (or use `make loadtest-replicated`). e.g. `make loadtest TPS=200000`.
 loadtest:
-	go run ./cmd/loadtest -tps $(TPS) -duration $(DURATION) -users $(USERS) -market $(MARKET) -levels $(LEVELS) -topology $(TOPOLOGY) -cores "$(CORES)" -journal async -flushcap $(FLUSHCAP)
+	go run ./cmd/loadtest -tps $(TPS) -duration $(DURATION) -users $(USERS) -market $(MARKET) -levels $(LEVELS) -topology $(TOPOLOGY) -cores "$(CORES)" -journal async -replication $(REPLICATION) -flushcap $(FLUSHCAP)
 
 loadtest-sync:
-	go run ./cmd/loadtest -tps $(TPS) -duration $(DURATION) -users $(USERS) -market $(MARKET) -levels $(LEVELS) -topology $(TOPOLOGY) -cores "$(CORES)" -journal sync -flushcap $(FLUSHCAP)
+	go run ./cmd/loadtest -tps $(TPS) -duration $(DURATION) -users $(USERS) -market $(MARKET) -levels $(LEVELS) -topology $(TOPOLOGY) -cores "$(CORES)" -journal sync -replication $(REPLICATION) -flushcap $(FLUSHCAP)
+
+# Production posture: async durable journal + a sync hot standby. The reported ack
+# SLO becomes durable+replicated-ack. Pick a TPS the in-process standby can sustain.
+loadtest-replicated:
+	go run ./cmd/loadtest -tps $(TPS) -duration $(DURATION) -users $(USERS) -market $(MARKET) -levels $(LEVELS) -topology $(TOPOLOGY) -cores "$(CORES)" -journal async -replication sync -flushcap $(FLUSHCAP)
 
 # Short load test for a quick check (10s, async durable).
 loadtest-quick:

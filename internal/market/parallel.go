@@ -207,7 +207,7 @@ func NewParallelEngine(cfg Config, groups [][]types.MarketID) *ParallelEngine {
 		pe.workers = append(pe.workers, &worker{reqs: reqs, resps: resps, shards: wshards, coll: coll, stop: &pe.stop})
 	}
 
-	pe.core = &Core{shards: coreShards, ledger: ledger, open: make(map[types.OrderID]openOrder, 1024), filters: cfg.Filters, qtyScale: cfg.QtyScale}
+	pe.core = &Core{shards: coreShards, ledger: ledger, open: make(map[types.OrderID]openOrder, 1024), filters: cfg.Filters, qtyScale: cfg.QtyScale, syncRep: cfg.ReplicationMode == "sync"}
 	pe.journaller = buildJournaller(cfg)
 	pe.replicator, pe.standby = buildReplicator(cfg)
 	pe.seq = sequencer.New(sequencer.Config{

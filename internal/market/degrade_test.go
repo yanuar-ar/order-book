@@ -34,6 +34,7 @@ func TestReleaseGate_DegradeDropsReplicationRequirement(t *testing.T) {
 	core := &Core{
 		shards: map[types.MarketID]shardOps{}, ledger: balance.New(balanceConfig(cfg)),
 		open: map[types.OrderID]openOrder{}, filters: cfg.Filters, qtyScale: cfg.QtyScale,
+		syncRep: true, // sync mode: acks gate on the standby
 	}
 	in := spsc.NewCommand(16)
 	in.Push(dep(1, usdt, 10))
@@ -54,6 +55,40 @@ func TestReleaseGate_DegradeDropsReplicationRequirement(t *testing.T) {
 	core.degraded = true
 	if g := releaseGate(seq, core); g != 3 {
 		t.Fatalf("degraded gate = %d, want 3 (durable alone)", g)
+	}
+}
+
+// Positive: async replication streams but does NOT gate acks — acks release on
+// durability alone even while the standby lags (replication off the critical
+// path). Only sync mode waits for the standby.
+func TestReleaseGate_AsyncReleasesOnDurable(t *testing.T) {
+	cfg := snapCfg(2)
+	build := func(sync bool) (*sequencer.Sequencer, *Core) {
+		core := &Core{
+			shards: map[types.MarketID]shardOps{}, ledger: balance.New(balanceConfig(cfg)),
+			open: map[types.OrderID]openOrder{}, filters: cfg.Filters, qtyScale: cfg.QtyScale,
+			syncRep: sync,
+		}
+		in := spsc.NewCommand(16)
+		in.Push(dep(1, usdt, 10))
+		in.Push(dep(1, usdt, 10))
+		in.Push(dep(1, usdt, 10))
+		seq := sequencer.New(sequencer.Config{
+			Inputs: []*spsc.RingCommand{in}, Journal: noopJournal{},
+			Replicator: &laggingRep{repSeq: 1}, Router: core, Clock: counterClock(),
+		})
+		for seq.Step() {
+		}
+		return seq, core
+	}
+
+	seqAsync, coreAsync := build(false)
+	if g := releaseGate(seqAsync, coreAsync); g != 3 {
+		t.Fatalf("async gate = %d, want durableSeq=3 (replication off the critical path)", g)
+	}
+	seqSync, coreSync := build(true)
+	if g := releaseGate(seqSync, coreSync); g != 1 {
+		t.Fatalf("sync gate = %d, want min(3,1)=1 (waits for the standby)", g)
 	}
 }
 

@@ -48,6 +48,11 @@ type Core struct {
 	// deterministically on replay; it is output-side only and is NOT part of the
 	// state fingerprint.
 	degraded bool
+	// syncRep is true only in "sync" replication mode, where acks must wait for the
+	// standby (gate on min(durableSeq, replicatedSeq)). In "async" (and "off") mode
+	// the replicator still streams but acks release on durability alone — replication
+	// is off the critical path with bounded lag. Set once at construction.
+	syncRep bool
 }
 
 // OnSettlement is unused in single-threaded mode (fills settle inline in
@@ -318,7 +323,7 @@ func NewEngine(cfg Config) *Engine {
 		impls[m] = s
 		shards[m] = s
 	}
-	core := &Core{shards: shards, ledger: ledger, open: make(map[types.OrderID]openOrder, 1024), filters: cfg.Filters, qtyScale: cfg.QtyScale}
+	core := &Core{shards: shards, ledger: ledger, open: make(map[types.OrderID]openOrder, 1024), filters: cfg.Filters, qtyScale: cfg.QtyScale, syncRep: cfg.ReplicationMode == "sync"}
 
 	ingress := spsc.NewCommand(cfg.RingSize)
 	reinject := spsc.NewCommand(cfg.RingSize)
@@ -450,14 +455,15 @@ func (e *Engine) MarketIDs() []types.MarketID {
 // After Drain the watermark equals Seq, so every ack is released.
 func (e *Engine) Acks() []types.Ack { return releasedAcks(e.core.acks, releaseGate(e.seq, e.core)) }
 
-// releaseGate is the highest Seq whose ack is safe to release. In the normal
-// (synced) mode it is the sequencer's min(durableSeq, replicatedSeq); once a
-// degrade-to-solo is in effect the replication requirement is dropped and the
-// gate is durableSeq alone. The degraded flag lives on the Core so it replays
-// deterministically; the watermarks live on the shared sequencer, so serial and
-// parallel engines gate identically.
+// releaseGate is the highest Seq whose ack is safe to release. It gates on
+// min(durableSeq, replicatedSeq) ONLY in sync replication mode and only while not
+// degraded — a command is then confirmed once durable AND replicated. In async
+// mode (replicator streams but off the critical path), off mode, or once a
+// degrade-to-solo is in effect, the gate is durableSeq alone. The syncRep and
+// degraded flags live on the Core (degraded replays deterministically); the
+// watermarks live on the shared sequencer, so serial and parallel gate identically.
 func releaseGate(seq *sequencer.Sequencer, core *Core) types.Seq {
-	if core.degraded {
+	if !core.syncRep || core.degraded {
 		return seq.DurableSeq()
 	}
 	return seq.ReleaseSeq()

@@ -56,10 +56,12 @@ parallel, like `buildJournaller`). The `Standby` is a shadow `Engine` in
 suppress-stops mode (replay posture) that applies the replicated stream via
 `ApplyJournaled` with a duplicate-Seq guard (`ApplyJournaled` is not idempotent);
 the `inProcessLink` drives it and backfills overflow gaps from the primary's
-`WALDir` via `Fetch`. `Acks()` (both topologies, via `releaseGate`) gate on
-`min(durableSeq, replicatedSeq)` in sync mode — a command is confirmed only once
-locally durable AND replicated — collapsing to `durableSeq` when off
-(behavior-neutral) or once a degrade-to-solo is in effect.
+`WALDir` via `Fetch`. **Sync vs async differ only in the ack gate** (`releaseGate`,
+both topologies): `sync` gates on `min(durableSeq, replicatedSeq)` — confirmed only
+once durable AND replicated; `async` streams off the critical path so acks release
+on `durableSeq` alone (bounded standby lag); `off` has no standby. A degrade-to-solo
+also drops a sync gate to `durableSeq`. Streaming itself is always off-thread in
+both modes (`Replicate` is non-blocking), so the primary's throughput is unchanged.
 
 - **Promotion** (`Standby.Promote`): increments the leadership term, primes the
   engine's `Seq`/`Epoch`, re-enables stops, and returns the now-live engine. The
