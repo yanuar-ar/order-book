@@ -1,10 +1,21 @@
 package market
 
 import (
+	"errors"
+
 	"github.com/yanuar-ar/order-book/internal/sequencer"
 	"github.com/yanuar-ar/order-book/internal/types"
 	"github.com/yanuar-ar/order-book/internal/wal"
 )
+
+// fetchCap bounds a single backfill so a standby that is hopelessly behind (e.g.
+// sharing cores with the primary under max load) makes incremental progress
+// rather than reading the whole WAL tail into one slice — the consumer simply
+// fetches again. Without it, sustained overflow allocates unbounded slices.
+const fetchCap = 1 << 16
+
+// errFetchCap stops wal.Replay early once a backfill batch is full.
+var errFetchCap = errors.New("fetch batch full")
 
 // Standby applies the replicated command stream to a shadow engine kept in
 // suppress-stops mode — exactly the replay posture (stop activations are streamed
@@ -100,16 +111,19 @@ func (l *inProcessLink) Fetch(afterSeq types.Seq) ([]types.Command, error) {
 	if l.walDir == "" {
 		return nil, nil
 	}
-	var out []types.Command
+	out := make([]types.Command, 0, fetchCap)
 	err := wal.Replay(l.walDir, uint64(afterSeq), func(rec wal.Record) error {
 		c, derr := types.DecodeCommand(rec.Payload)
 		if derr != nil {
 			return derr
 		}
 		out = append(out, c)
+		if len(out) >= fetchCap {
+			return errFetchCap // bounded batch; the consumer fetches again for more
+		}
 		return nil
 	})
-	if err != nil {
+	if err != nil && err != errFetchCap {
 		return nil, err
 	}
 	return out, nil

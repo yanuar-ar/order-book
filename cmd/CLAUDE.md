@@ -18,8 +18,13 @@ paths; their shared building blocks live in `cmd/internal/harness`.
   durable path, **the default**), `sync` (inline group-commit fsync), or `none`
   (no WAL, the raw matching ceiling). `-flushcap` tunes the group-commit batch
   (commands per fsync; bigger amortizes I/O harder at the cost of durable-ack
-  latency); `-wal <dir>` overrides the temp WAL dir. On the dev machine: raw
-  ~1.4M, async durable ~1.3M, sync durable saturates lower with worse tails.
+  latency); `-wal <dir>` overrides the temp WAL dir. `-replication off|sync|async`
+  adds an **in-process hot standby** (the production posture): the primary's
+  ceiling holds (~1M durable-async with a standby following, since `Replicate` is
+  non-blocking), but the standby applies every command on the same box and shares
+  cores, so this is a lower bound vs a real 2-node deployment. On the dev machine:
+  raw ~1.4M, async durable ~1.3M, async durable + sync standby ~1.0M, sync durable
+  saturates lower with worse tails.
   `-cpuprofile <path>` writes a CPU profile of the
   measured window (profiles the whole process; read the engine cost under
   `market.(*Engine).Step` and ignore the producer's backpressure-spin in
@@ -37,8 +42,13 @@ paths; their shared building blocks live in `cmd/internal/harness`.
   the matcher in parallel topology. `-journal async|sync|none` (default `async`,
   + optional `-wal`, `-flushcap`) selects journaling; in the durable modes it
   reports **two SLOs** separately: *internal match latency* (intended→matched) and
-  *durable-ack latency* (intended→WAL-durable, tracked O(1) via `AcksAll`+
-  `DurableSeq` with a cursor — no per-command rescan). Comparing `loadtest` vs
+  *durable-ack latency* (intended→release watermark, tracked O(1) via `AcksAll`+
+  `ReleasedSeq` with a cursor — no per-command rescan). `-replication off|sync|async`
+  adds an in-process hot standby; in `sync` the ack SLO becomes
+  *durable+replicated-ack* (`ReleasedSeq = min(durableSeq, replicatedSeq)`), so the
+  reported tail includes the standby — at a rate the in-process standby can sustain
+  (it shares cores) the SLO is bounded; above it the tail blows up, exactly the
+  signal a load test should give. Comparing `loadtest` vs
   `loadtest -journal sync` shows async keeping match-latency tails in µs (vs tens
   of ms when fsync blocks the matcher inline) — e.g. at 500k tps, match p99 ~10ms
   async vs ~77ms sync.

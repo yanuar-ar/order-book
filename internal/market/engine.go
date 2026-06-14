@@ -416,8 +416,14 @@ func (e *Engine) Drain() {
 	for e.seq.Step() {
 	}
 	_ = e.seq.DrainJournal()
-	_ = e.seq.DrainReplication() // make the standby catch up (journal drained first)
 }
+
+// DrainStandby blocks until the hot standby has durably applied every replicated
+// command so far (a no-op when replication is off). It is the graceful standby
+// catch-up — distinct from Drain (primary durability) and Close (abrupt stop that
+// abandons any lag). Call it after Drain at quiesce points where the standby must
+// be converged: snapshot, promotion, or a convergence assertion.
+func (e *Engine) DrainStandby() error { return e.seq.DrainReplication() }
 
 // Ledger exposes the balance ledger (read access for invariants/tests).
 func (e *Engine) Ledger() *balance.Ledger { return e.core.ledger }
@@ -484,6 +490,12 @@ func (e *Engine) Fatal() error { return e.seq.Fatal() }
 
 // DurableSeq returns the highest Seq whose WAL bytes have been fsynced.
 func (e *Engine) DurableSeq() types.Seq { return e.seq.DurableSeq() }
+
+// ReleasedSeq returns the highest Seq whose ack is releasable — the gate Acks()
+// uses. It equals DurableSeq when replication is off (or degraded), and
+// min(durableSeq, replicatedSeq) in sync mode (a command is released only once
+// durable AND replicated). Harnesses cursor on it to measure ack-release latency.
+func (e *Engine) ReleasedSeq() types.Seq { return releaseGate(e.seq, e.core) }
 
 // SetSeq primes the sequencer watermark. Used by snapshot restore (before live
 // stepping resumes) so post-restore commands continue contiguously.

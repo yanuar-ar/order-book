@@ -87,6 +87,7 @@ func runDifferentialReplicated(e *market.Engine, stream Stream) error {
 		c.Seq = types.Seq(i + 1)
 		applyNet(net, e, c)
 		mod.Apply(c)
+		_ = e.DrainStandby() // converge the standby before the per-step INV-REP check
 
 		if engineState(e).Canonical() != mod.Snapshot().Canonical() {
 			return fmt.Errorf("state diverged at order step %d (cmd %+v)", i, c)

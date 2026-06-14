@@ -47,6 +47,7 @@ func main() {
 	view := flag.Int("market", 0, "market id to display (0=BTC,1=ETH,2=SOL)")
 	levels := flag.Int("levels", 16, "order-book depth levels to show per side")
 	journal := flag.String("journal", "async", "journal mode: async (off-thread fsync, default — the 1M durable path) | sync (inline fsync) | none (no WAL, raw ceiling)")
+	replication := flag.String("replication", "off", "replication mode: off (default) | sync (hot standby, the production posture — acks gate on min(durable,replicated)) | async (stream off the critical path)")
 	walDir := flag.String("wal", "", "WAL directory for durable modes (default: a temp dir, removed on exit)")
 	flushCap := flag.Int("flushcap", 0, "group-commit batch ceiling (commands per fsync; 0 = engine default). Bigger amortizes fsync harder on the durable path")
 	cpuprofile := flag.String("cpuprofile", "", "write a CPU profile to this path for the measured window")
@@ -58,18 +59,30 @@ func main() {
 		fmt.Println("invalid -journal:", *journal, "(want async | sync | none)")
 		return
 	}
+	switch *replication {
+	case "off", "sync", "async":
+	default:
+		fmt.Println("invalid -replication:", *replication, "(want off | sync | async)")
+		return
+	}
 	durable := *journal != "none"
 	async := *journal == "async"
+	replicated := *replication != "off"
 
 	var groups [][]types.MarketID
 	if *topology == "parallel" {
 		groups = harness.ParseCores(*cores)
-		// cores for workers + control + producer.
-		if want := len(groups) + 2; runtime.GOMAXPROCS(0) < want {
+		// cores for workers + control + producer (+ replicator/standby when on).
+		extra := 2
+		if replicated {
+			extra = 3
+		}
+		if want := len(groups) + extra; runtime.GOMAXPROCS(0) < want {
 			runtime.GOMAXPROCS(want)
 		}
-	} else if runtime.GOMAXPROCS(0) < 3 {
-		runtime.GOMAXPROCS(3)
+	} else if min := 3 + b2i(replicated); runtime.GOMAXPROCS(0) < min {
+		// serial: control + producer + journaller (+ replicator consumer/standby).
+		runtime.GOMAXPROCS(min)
 	}
 
 	cfg := harness.DefaultConfig()
@@ -96,7 +109,9 @@ func main() {
 		}
 		defer w.Close()
 		cfg.Journal = w
+		cfg.WALDir = dir // the in-process standby backfills overflow gaps from here
 	}
+	cfg.ReplicationMode = *replication
 
 	eng, cleanup, err := harness.BuildEngine(*topology, groups, cfg)
 	if err != nil {
@@ -114,7 +129,7 @@ func main() {
 	startSeq := eng.Seq()
 	total := *warmup + *n
 	title := "spot order-book throughput"
-	sub := subLine(*topology, *n, *warmup, durable, async, groups)
+	sub := subLine(*topology, *n, *warmup, durable, async, *replication, groups)
 	h := harness.NewHist()
 	var framePtr atomic.Pointer[harness.Frame]
 	var stop atomic.Bool
@@ -211,11 +226,11 @@ func main() {
 	processed := int64(eng.Seq() - startSeq)
 	final := harness.BuildFrame(eng, types.MarketID(*view), *levels, h, title, sub, processed, elapsed, atomic.LoadInt64(&backpressure))
 	harness.Render(final)
-	printSummary(*topology, *n, *warmup, *rngseed, durable, async, groups, processed, elapsed, atomic.LoadInt64(&produced), atomic.LoadInt64(&backpressure), h)
+	printSummary(*topology, *n, *warmup, *rngseed, durable, async, *replication, groups, processed, elapsed, atomic.LoadInt64(&produced), atomic.LoadInt64(&backpressure), h)
 }
 
 // subLine is the TUI sub-line: topology + run mode + (parallel) the worker map.
-func subLine(topology string, n, warmup int, durable, async bool, groups [][]types.MarketID) string {
+func subLine(topology string, n, warmup int, durable, async bool, replication string, groups [][]types.MarketID) string {
 	mode := "duration"
 	if n > 0 {
 		mode = fmt.Sprintf("fixed n=%d warmup=%d", n, warmup)
@@ -227,10 +242,21 @@ func subLine(topology string, n, warmup int, durable, async bool, groups [][]typ
 			journal = "durable WAL (async)"
 		}
 	}
-	if topology != "parallel" {
-		return "topology serial  " + mode + "  " + journal
+	rep := ""
+	if replication != "off" {
+		rep = "  +standby (" + replication + ")"
 	}
-	return "topology parallel  " + mode + "  " + journal + "  " + workerLayout(groups)
+	if topology != "parallel" {
+		return "topology serial  " + mode + "  " + journal + rep
+	}
+	return "topology parallel  " + mode + "  " + journal + rep + "  " + workerLayout(groups)
+}
+
+func b2i(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 func workerLayout(groups [][]types.MarketID) string {
@@ -245,7 +271,7 @@ func workerLayout(groups [][]types.MarketID) string {
 	return strings.Join(parts, "  ")
 }
 
-func printSummary(topology string, n, warmup int, rngseed int64, durable, async bool, groups [][]types.MarketID, processed int64, elapsed time.Duration, produced, backpressure int64, h *harness.Hist) {
+func printSummary(topology string, n, warmup int, rngseed int64, durable, async bool, replication string, groups [][]types.MarketID, processed int64, elapsed time.Duration, produced, backpressure int64, h *harness.Hist) {
 	fmt.Printf("\n==== throughput (%s topology) ====\n", topology)
 	if topology == "parallel" {
 		fmt.Printf("workers           : %s\n", workerLayout(groups))
@@ -258,6 +284,11 @@ func printSummary(topology string, n, warmup int, rngseed int64, durable, async 
 		}
 	}
 	fmt.Printf("journal           : %s\n", journal)
+	rep := "off"
+	if replication != "off" {
+		rep = replication + " (in-process hot standby — shares cores, so this is a lower bound vs a 2-node setup)"
+	}
+	fmt.Printf("replication       : %s\n", rep)
 	if n > 0 {
 		fmt.Printf("mode              : fixed count n=%d warmup=%d rngseed=%d (reproducible)\n", n, warmup, rngseed)
 	} else {

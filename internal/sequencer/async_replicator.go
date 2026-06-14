@@ -127,6 +127,14 @@ func (r *AsyncReplicator) run() {
 	var lastSent types.Seq
 	var c types.Command
 	for {
+		if r.stop.Load() {
+			// Close is abrupt: abandon any catch-up (graceful catch-up is Drain's
+			// job). Still surface a dead link so Close reports the failure.
+			if f := r.link.Fatal(); f != nil {
+				r.latch(f)
+			}
+			return
+		}
 		if f := r.link.Fatal(); f != nil {
 			r.latch(f)
 			return
@@ -164,9 +172,6 @@ func (r *AsyncReplicator) run() {
 				return
 			}
 			continue
-		}
-		if r.stop.Load() {
-			return
 		}
 		runtime.Gosched()
 	}

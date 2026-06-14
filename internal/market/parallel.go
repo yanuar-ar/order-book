@@ -244,8 +244,11 @@ func (pe *ParallelEngine) Drain() {
 	for pe.seq.Step() {
 	}
 	_ = pe.seq.DrainJournal()
-	_ = pe.seq.DrainReplication()
 }
+
+// DrainStandby blocks until the hot standby has caught up (no-op when off). See
+// Engine.DrainStandby.
+func (pe *ParallelEngine) DrainStandby() error { return pe.seq.DrainReplication() }
 
 // Ledger exposes the balance ledger (read after Drain/Close for consistency).
 func (pe *ParallelEngine) Ledger() *balance.Ledger { return pe.core.ledger }
@@ -270,6 +273,9 @@ func (pe *ParallelEngine) AcksAll() []types.Ack { return pe.core.acks }
 
 // DurableSeq returns the highest Seq whose WAL bytes have been fsynced.
 func (pe *ParallelEngine) DurableSeq() types.Seq { return pe.seq.DurableSeq() }
+
+// ReleasedSeq returns the releasable-ack watermark (see Engine.ReleasedSeq).
+func (pe *ParallelEngine) ReleasedSeq() types.Seq { return releaseGate(pe.seq, pe.core) }
 
 // Seq returns the last assigned sequence number.
 func (pe *ParallelEngine) Seq() types.Seq { return pe.seq.Seq() }

@@ -47,6 +47,7 @@ type Engine interface {
 	AcksAll() []types.Ack // ungated acks; pair with DurableSeq for O(1) durable-ack tracking
 	Seq() types.Seq
 	DurableSeq() types.Seq
+	ReleasedSeq() types.Seq // releasable-ack watermark: min(durable,replicated) in sync replication, else durable
 	Shard(types.MarketID) *market.Shard
 	Ledger() *balance.Ledger
 	MarketIDs() []types.MarketID

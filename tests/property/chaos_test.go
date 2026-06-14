@@ -29,6 +29,7 @@ func TestChaos_PrimaryCrashPromotion(t *testing.T) {
 		t.Run("seed="+itoa(seed), func(t *testing.T) {
 			e := market.NewEngine(replicatedChaosCfg())
 			net := feedTrackingNet(e, GenSharp(seed, 600)) // drains each command
+			_ = e.DrainStandby()                           // converge the standby before crashing
 
 			confirmed := e.Acks()
 			s := e.Standby()
