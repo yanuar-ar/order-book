@@ -46,12 +46,20 @@ func main() {
 	users := flag.Int("users", 100, "account pool size")
 	view := flag.Int("market", 0, "market id to display (0=BTC,1=ETH,2=SOL)")
 	levels := flag.Int("levels", 16, "order-book depth levels to show per side")
-	durable := flag.Bool("durable", false, "journal to a real WAL (group-commit fsync) instead of the no-op journal — the honest durable ceiling")
-	walDir := flag.String("wal", "", "WAL directory for -durable (default: a temp dir, removed on exit)")
+	journal := flag.String("journal", "async", "journal mode: async (off-thread fsync, default — the 1M durable path) | sync (inline fsync) | none (no WAL, raw ceiling)")
+	walDir := flag.String("wal", "", "WAL directory for durable modes (default: a temp dir, removed on exit)")
 	flushCap := flag.Int("flushcap", 0, "group-commit batch ceiling (commands per fsync; 0 = engine default). Bigger amortizes fsync harder on the durable path")
-	async := flag.Bool("async", false, "journal off the matcher goroutine (AsyncJournaller) — the path to 1M durable TPS. Requires -durable")
 	cpuprofile := flag.String("cpuprofile", "", "write a CPU profile to this path for the measured window")
 	flag.Parse()
+
+	switch *journal {
+	case "async", "sync", "none":
+	default:
+		fmt.Println("invalid -journal:", *journal, "(want async | sync | none)")
+		return
+	}
+	durable := *journal != "none"
+	async := *journal == "async"
 
 	var groups [][]types.MarketID
 	if *topology == "parallel" {
@@ -66,15 +74,11 @@ func main() {
 
 	cfg := harness.DefaultConfig()
 	cfg.FlushCap = *flushCap
-	if *async {
-		if !*durable {
-			fmt.Println("-async requires -durable (nothing to fsync off-thread without a real WAL)")
-			return
-		}
+	if async {
 		cfg.AsyncJournal = true
 		cfg.JournalBatchCap = *flushCap
 	}
-	if *durable {
+	if durable {
 		dir := *walDir
 		if dir == "" {
 			d, err := os.MkdirTemp("", "throughput-wal-")
@@ -110,7 +114,7 @@ func main() {
 	startSeq := eng.Seq()
 	total := *warmup + *n
 	title := "spot order-book throughput"
-	sub := subLine(*topology, *n, *warmup, *durable, *async, groups)
+	sub := subLine(*topology, *n, *warmup, durable, async, groups)
 	h := harness.NewHist()
 	var framePtr atomic.Pointer[harness.Frame]
 	var stop atomic.Bool
@@ -207,7 +211,7 @@ func main() {
 	processed := int64(eng.Seq() - startSeq)
 	final := harness.BuildFrame(eng, types.MarketID(*view), *levels, h, title, sub, processed, elapsed, atomic.LoadInt64(&backpressure))
 	harness.Render(final)
-	printSummary(*topology, *n, *warmup, *rngseed, *durable, *async, groups, processed, elapsed, atomic.LoadInt64(&produced), atomic.LoadInt64(&backpressure), h)
+	printSummary(*topology, *n, *warmup, *rngseed, durable, async, groups, processed, elapsed, atomic.LoadInt64(&produced), atomic.LoadInt64(&backpressure), h)
 }
 
 // subLine is the TUI sub-line: topology + run mode + (parallel) the worker map.

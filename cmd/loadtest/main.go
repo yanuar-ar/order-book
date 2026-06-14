@@ -37,23 +37,27 @@ func main() {
 	levels := flag.Int("levels", 16, "order-book depth levels to show per side")
 	topology := flag.String("topology", "serial", "engine topology: serial | parallel")
 	cores := flag.String("cores", "0;1,2", "parallel only: market->worker map ('0;1,2')")
-	durable := flag.Bool("durable", false, "journal to a real WAL (group-commit fsync) and measure durable-ack latency")
-	async := flag.Bool("async", false, "journal off the matcher goroutine (AsyncJournaller). Requires -durable")
+	journal := flag.String("journal", "async", "journal mode: async (off-thread fsync, default) | sync (inline fsync) | none (no WAL, match latency only)")
 	flushCap := flag.Int("flushcap", 0, "group-commit batch ceiling (commands per fsync; 0 = engine default)")
-	walDir := flag.String("wal", "", "WAL directory for -durable (default: a temp dir, removed on exit)")
+	walDir := flag.String("wal", "", "WAL directory for durable modes (default: a temp dir, removed on exit)")
 	flag.Parse()
+
+	switch *journal {
+	case "async", "sync", "none":
+	default:
+		fmt.Println("invalid -journal:", *journal, "(want async | sync | none)")
+		return
+	}
+	durable := *journal != "none"
+	async := *journal == "async"
 
 	var groups [][]types.MarketID
 	if *topology == "parallel" {
 		groups = harness.ParseCores(*cores)
 	}
-	if *async && !*durable {
-		fmt.Println("-async requires -durable (nothing to fsync off-thread without a real WAL)")
-		return
-	}
 	cfg := harness.DefaultConfig()
 	cfg.FlushCap = *flushCap
-	if *durable {
+	if durable {
 		dir := *walDir
 		if dir == "" {
 			d, err := os.MkdirTemp("", "loadtest-wal-")
@@ -71,7 +75,7 @@ func main() {
 		}
 		defer w.Close() // LIFO: runs after cleanup() closes the engine/journaller
 		cfg.Journal = w
-		if *async {
+		if async {
 			cfg.AsyncJournal = true
 			cfg.JournalBatchCap = *flushCap
 		}
@@ -105,7 +109,7 @@ func main() {
 	go harness.DisplayLoop(&framePtr, stop)
 
 	title := "spot order-book load test"
-	sub := topologyLine(*topology, groups) + "  " + journalLabel(*durable, *async)
+	sub := topologyLine(*topology, groups) + "  " + journalLabel(durable, async)
 
 	interval := time.Duration(int64(time.Second) / int64(*tps))
 	start := time.Now()
@@ -129,7 +133,7 @@ func main() {
 		eng.Step()
 		done := time.Now()
 		h.Record(done.Sub(intended).Nanoseconds()) // match latency (coordinated-omission-correct)
-		if *durable {
+		if durable {
 			// Durable-ack latency: advance a cursor over the ungated ack log up to
 			// the durable watermark (O(1) amortized — no O(prefix) rescan), and
 			// record each newly-durable ack from its intended time.
@@ -161,7 +165,7 @@ func main() {
 
 	final := harness.BuildFrame(eng, types.MarketID(*view), *levels, h, title, sub, i, time.Since(start), backpressure)
 	harness.Render(final)
-	printSummary(final, hDur, *durable, *async)
+	printSummary(final, hDur, durable, async)
 }
 
 // journalLabel describes the journaling path for the TUI sub-line and summary.

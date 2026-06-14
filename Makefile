@@ -1,4 +1,4 @@
-.PHONY: fmt lint vet test race bench build property differential fuzz throughput throughput-async loadtest loadtest-async loadtest-quick clean
+.PHONY: fmt lint vet test race bench build property differential fuzz throughput throughput-sync loadtest loadtest-sync loadtest-quick clean
 
 # Override on the command line, e.g. `make loadtest TPS=200000 DURATION=1m MARKET=1`.
 TPS ?= 500000
@@ -56,28 +56,28 @@ fuzz:
 	go test ./tests/property/ -run '^$$' -fuzz '^FuzzEngine$$' -fuzztime=$(FUZZTIME)
 
 # "How fast can it go": full engine at max rate with offloaded generation.
-# Both targets journal durably to a real WAL; `throughput` uses the inline (sync)
-# journaller and `throughput-async` fsyncs off the matcher goroutine (the 1M
-# durable path). Serial (default) or parallel; for parallel, CORES maps
-# markets->workers. e.g. `make throughput-async FLUSHCAP=16384`.
+# Both journal durably to a real WAL; `throughput` is **async** (off-thread fsync,
+# the 1M durable path — the default), `throughput-sync` uses the inline journaller.
+# Serial (default) or parallel; for parallel, CORES maps markets->workers.
+# e.g. `make throughput FLUSHCAP=16384`, or `make throughput-sync` to compare.
 throughput:
-	go run ./cmd/throughput -topology $(TOPOLOGY) -cores "$(CORES)" -duration $(DURATION) -users $(USERS) -durable -flushcap $(FLUSHCAP)
+	go run ./cmd/throughput -topology $(TOPOLOGY) -cores "$(CORES)" -duration $(DURATION) -users $(USERS) -journal async -flushcap $(FLUSHCAP)
 
-throughput-async:
-	go run ./cmd/throughput -topology $(TOPOLOGY) -cores "$(CORES)" -duration $(DURATION) -users $(USERS) -durable -async -flushcap $(FLUSHCAP)
+throughput-sync:
+	go run ./cmd/throughput -topology $(TOPOLOGY) -cores "$(CORES)" -duration $(DURATION) -users $(USERS) -journal sync -flushcap $(FLUSHCAP)
 
 # "How does it behave at load X": open-loop paced load with a live order-book TUI
-# and two-SLO latency (internal match + durable-ack). `loadtest` is sync,
-# `loadtest-async` journals off-thread. e.g. `make loadtest-async TPS=200000`.
+# and two-SLO latency (internal match + durable-ack). `loadtest` is **async**
+# (default), `loadtest-sync` journals inline. e.g. `make loadtest TPS=200000`.
 loadtest:
-	go run ./cmd/loadtest -tps $(TPS) -duration $(DURATION) -users $(USERS) -market $(MARKET) -levels $(LEVELS) -topology $(TOPOLOGY) -cores "$(CORES)" -durable -flushcap $(FLUSHCAP)
+	go run ./cmd/loadtest -tps $(TPS) -duration $(DURATION) -users $(USERS) -market $(MARKET) -levels $(LEVELS) -topology $(TOPOLOGY) -cores "$(CORES)" -journal async -flushcap $(FLUSHCAP)
 
-loadtest-async:
-	go run ./cmd/loadtest -tps $(TPS) -duration $(DURATION) -users $(USERS) -market $(MARKET) -levels $(LEVELS) -topology $(TOPOLOGY) -cores "$(CORES)" -durable -async -flushcap $(FLUSHCAP)
+loadtest-sync:
+	go run ./cmd/loadtest -tps $(TPS) -duration $(DURATION) -users $(USERS) -market $(MARKET) -levels $(LEVELS) -topology $(TOPOLOGY) -cores "$(CORES)" -journal sync -flushcap $(FLUSHCAP)
 
-# Short load test for a quick check (10s, sync durable).
+# Short load test for a quick check (10s, async durable).
 loadtest-quick:
-	go run ./cmd/loadtest -tps $(TPS) -duration 10s -users $(USERS) -market $(MARKET) -levels $(LEVELS) -topology $(TOPOLOGY) -cores "$(CORES)" -durable -flushcap $(FLUSHCAP)
+	go run ./cmd/loadtest -tps $(TPS) -duration 10s -users $(USERS) -market $(MARKET) -levels $(LEVELS) -topology $(TOPOLOGY) -cores "$(CORES)" -journal async -flushcap $(FLUSHCAP)
 
 clean:
 	rm -rf bin
