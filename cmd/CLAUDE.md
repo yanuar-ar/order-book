@@ -17,7 +17,10 @@ paths; their shared building blocks live in `cmd/internal/harness`.
   `-durable` (with optional `-wal <dir>`) journals to a real WAL with
   group-commit fsync — the honest durable ceiling — and `-flushcap` tunes the
   group-commit batch (commands per fsync; bigger amortizes I/O harder at the cost
-  of durable-ack latency). Renders the same live order-book TUI as `loadtest`
+  of durable-ack latency). `-cpuprofile <path>` writes a CPU profile of the
+  measured window (profiles the whole process; read the engine cost under
+  `market.(*Engine).Step` and ignore the producer's backpressure-spin in
+  `main.func1`). Renders the same live order-book TUI as `loadtest`
   plus a final summary with engine step-latency percentiles. The frame is built **on the engine goroutine**
   between its own `Step` calls (the sole book mutator in serial; workers idle
   between the control goroutine's synchronous steps in parallel), so the live
