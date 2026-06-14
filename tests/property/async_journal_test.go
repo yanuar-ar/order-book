@@ -105,6 +105,66 @@ func TestAsyncSameSeedDeterministic(t *testing.T) {
 	}
 }
 
+// FuzzAsyncEngine (U8) extends coverage-guided fuzzing to the async-journaller
+// path: every decoded byte stream must agree with the oracle and hold every
+// invariant. Run: go test -run '^$' -fuzz=FuzzAsyncEngine ./tests/property/
+func FuzzAsyncEngine(f *testing.F) {
+	f.Add([]byte{})
+	f.Add([]byte{2, 1, 0, 0, 1, 100, 5, 0, 2, 1, 1, 0, 3, 100, 5, 0})
+	f.Add(bytes.Repeat([]byte{3, 2, 1, 0, 5, 100, 2, 0}, 12))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		if len(data) > 4096 {
+			data = data[:4096]
+		}
+		if err := RunDifferentialAsync(decodeStream(data)); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+// TestAsyncWALRecovers (U8): a stream journaled through the AsyncJournaller
+// replays from the WAL to a byte-identical state — recovery is transparent to
+// which journaller wrote the log (a direct corollary of the byte-identical-WAL
+// property, asserted end-to-end through market.Recover).
+func TestAsyncWALRecovers(t *testing.T) {
+	stream := GenSharp(5, 1200)
+	walDir := t.TempDir()
+	snapDir := t.TempDir() // empty -> full WAL replay
+
+	w, err := wal.OpenWriter(walDir, 0)
+	if err != nil {
+		t.Fatalf("open WAL: %v", err)
+	}
+	cfg := engineCfg()
+	cfg.Journal = w
+	cfg.AsyncJournal = true
+	cfg.JournalCore = -1
+	a := market.NewEngine(cfg)
+	for _, c := range stream.Deposits {
+		a.Submit(c)
+	}
+	for i, c := range stream.Orders {
+		c.Seq = types.Seq(i + 1)
+		a.Submit(c)
+	}
+	a.Drain()
+	want := a.StateFingerprint()
+	if err := a.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("close WAL: %v", err)
+	}
+
+	rec, err := market.Recover(engineCfg(), walDir, snapDir, nil)
+	if err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	if !bytes.Equal(want, rec.StateFingerprint()) {
+		t.Fatal("recovered state from async-journaled WAL differs from the original")
+	}
+}
+
 // TestDifferentialAsyncMatchesOracle (U7): the async-journaller engine agrees
 // with the independent reference oracle on canonical state and every invariant
 // after each command, across the broad and sharp generators.
