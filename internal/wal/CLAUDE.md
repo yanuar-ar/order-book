@@ -16,7 +16,9 @@ Clustering/failover and backup/DR are out of scope for v1.
   is the sequencer's `flushCap`, which governs durable throughput vs durable-ack
   latency.
 - `record.go` — on-disk record framing.
-- `snapshot.go` — point-in-time state snapshot (book + ledger).
+- `snapshot.go` — point-in-time state snapshot (book + ledger). The container
+  header carries the watermark `Seq` and the leadership `Epoch` (primed on
+  Restore, so fencing survives a cold restart from snapshot + empty tail).
 - `replay.go` — replay records (optionally from a snapshot) to rebuild state.
 
 ## Constraints

@@ -23,6 +23,17 @@ onward; it also drains market fills and applies settlement in deterministic
   `durableSeq`, and `Append` backpressures (spins, never drops) when the ring is
   full. An Append/Sync error latches a fatal the sequencer observes via
   `Fatal()`. Selected by `market.Config.AsyncJournal`.
+- `replicator.go` — the `Replicator` seam (Replicate / Flush / Drain /
+  ReplicatedSeq / Fatal / Close), the structural mirror of `Journaller` for the
+  hot-standby stream, and `NopReplicator`, the default for replication `off`
+  (`ReplicatedSeq` is `+inf`, so the ack gate stays `durableSeq`-only). The
+  sequencer stamps a leadership-term `Epoch` on every command (bumped on
+  promotion), calls `Replicate` after the durable `Append` in `sequenceAndRoute`,
+  gates output on `ReleaseSeq() = min(durableSeq, replicatedSeq)`, and halts on a
+  replicator fatal. `Replicate` is **non-blocking** (a slow/dead standby stalls
+  acks only, never journaling or matching). The off-thread `AsyncReplicator` and
+  the standby apply/promotion/degrade machinery are the remaining replicator
+  units (see `docs/plans/2026-06-14-007-feat-replicator-hot-standby-plan.md`).
 
 ## Durable-ack barrier
 

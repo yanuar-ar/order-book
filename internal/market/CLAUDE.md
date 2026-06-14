@@ -44,6 +44,21 @@ sequencer, balance authority, and shards together. Provides both the serial
 - `recover.go` — `Recover`: load latest snapshot + replay WAL tail, falling back
   to full replay from `Seq` 0 (logged) on a missing/corrupt/incompatible
   snapshot; primes the sequencer to the final journaled `Seq` for live resume.
+  Also primes the leadership `Epoch` and fences the replay (`ErrStaleEpoch`): a
+  command whose term steps below the highest seen is a spliced zombie record and
+  halts recovery.
+
+## Replication (hot standby)
+
+`Engine.Acks()` / `ParallelEngine.Acks()` gate on
+`Sequencer.ReleaseSeq() = min(durableSeq, replicatedSeq)`, so in sync replication
+mode a command is confirmed only once it is both locally durable and replicated;
+with replication `off` the replicated watermark is `+inf` and the gate collapses
+to `durableSeq` (behavior-neutral). `Config.ReplicationMode`/`ReplicationRing`
+select the replicator. The live `AsyncReplicator`, the in-process `StandbyLink`,
+the standby apply/catch-up path, manual epoch-fenced promotion, and degrade-to-
+solo are tracked in
+`docs/plans/2026-06-14-007-feat-replicator-hot-standby-plan.md` (U4–U10).
 
 ## Constraints
 
