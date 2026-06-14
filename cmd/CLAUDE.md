@@ -17,7 +17,10 @@ paths; their shared building blocks live in `cmd/internal/harness`.
   `-durable` (with optional `-wal <dir>`) journals to a real WAL with
   group-commit fsync — the honest durable ceiling — and `-flushcap` tunes the
   group-commit batch (commands per fsync; bigger amortizes I/O harder at the cost
-  of durable-ack latency). `-cpuprofile <path>` writes a CPU profile of the
+  of durable-ack latency). `-async` (with `-durable`) journals on the
+  AsyncJournaller goroutine instead of inline — fsync off the matcher thread, the
+  path to 1M durable TPS (~820k inline → ~1.38M async on the dev machine).
+  `-cpuprofile <path>` writes a CPU profile of the
   measured window (profiles the whole process; read the engine cost under
   `market.(*Engine).Step` and ignore the producer's backpressure-spin in
   `main.func1`). Renders the same live order-book TUI as `loadtest`
