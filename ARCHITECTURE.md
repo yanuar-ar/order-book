@@ -54,14 +54,23 @@ Engine ini mewarisi empat prinsip itu secara langsung:
 | **Ring buffer, bukan queue** | Handoff antar-tahap memakai SPSC ring lock-free, bukan channel Go. |
 
 **Perbedaan penting dari LMAX klasik:** LMAX menjalankan SELURUH logika bisnis di
-satu thread. Engine ini punya **dua topologi**:
+satu thread. Engine ini punya **dua topologi** matching **dan** dua mode
+journaling yang ortogonal:
 
-- **Serial (v1, default)** — sequencer + ledger + matching berjalan **inline di
-  satu goroutine**. Ini paling setia pada model BLP LMAX dan paling sederhana
-  untuk dibuktikan benar.
-- **Paralel** — market di-*shard* ke beberapa goroutine **worker yang
-  di-pin ke core berbeda**, sementara jalur kontrol (sequencer + ledger) tetap
-  satu penulis. Ini *refinement* untuk isolasi & paralelisme per-market.
+- **Topologi matching:**
+  - **Serial (default)** — sequencer + ledger + matching berjalan **inline di
+    satu goroutine**. Paling setia pada model BLP LMAX, paling sederhana dibuktikan.
+  - **Paralel** — market di-*shard* ke goroutine **worker di core berbeda**,
+    jalur kontrol (sequencer + ledger) tetap satu penulis. *Refinement* untuk
+    isolasi & paralelisme per-market.
+- **Mode journaling (§9.4):**
+  - **Sync** — Append + fsync inline di goroutine sequencer.
+  - **Async** — fsync pindah ke goroutine **Journaller** terpisah (core sendiri)
+    sehingga matcher tak pernah beku menunggu disk → jalur **1 juta TPS durable**.
+
+Korektnesnya identik di semua kombinasi; bedanya throughput, latency tail, dan
+jumlah core. Defaultnya: serial matching, dan **async journaling** untuk benchmark
+(`.env.example` merekomendasikan `OB_JOURNAL_MODE=async`).
 
 ---
 
@@ -158,7 +167,7 @@ flowchart LR
 |---|---|---|
 | **Business Logic Processor** | sequencer + balance + market shard | `internal/sequencer`, `internal/balance`, `internal/market` |
 | **Input disruptor** | SPSC ring ingress + reinject | `internal/spsc` |
-| **Journaller** | WAL (segmented, CRC, group-commit) | `internal/wal` |
+| **Journaller** | seam `Journaller` (sync inline / **async goroutine konsumer**) di atas WAL segmented+CRC+group-commit | `internal/sequencer/journaller.go`, `async_journaller.go`, `internal/wal` |
 | **Replicator** | replikasi Raft (**out-of-scope v1**) | — |
 | **Un-marshaller** | `types.DecodeCommand` (codec WAL) | `internal/types/codec.go` |
 | **Sequence barrier (persist sebelum lepas output)** | *durable-ack barrier* — ack hanya rilis di bawah `DurableSeq` | `internal/sequencer/sequencer.go` |
@@ -166,9 +175,12 @@ flowchart LR
 | **Mechanical sympathy** | SPSC cache-line padded, zero-alloc, pin core | `internal/spsc`, `internal/platform` |
 | **Batching effect** | drain batch fill + group-commit WAL | `internal/sequencer`, `internal/wal` |
 
-> **Catatan jujur:** *Replicator* (HA via Raft) belum ada di v1. *Output
-> disruptor* di v1 berupa buffer ack yang dirilis bertahap sesuai watermark
-> durable, bukan ring publisher penuh. Keduanya dirancang masuk di fase HA.
+> **Catatan jujur:** dalam mode **async**, *Journaller* kini benar-benar jadi
+> consumer paralel atas stream command — pola input-disruptor LMAX yang
+> sesungguhnya (matcher & Journaller jalan bersamaan, barrier sebelum lepas
+> output). *Replicator* (HA via Raft) belum ada di v1. *Output disruptor* di v1
+> berupa buffer ack yang dirilis bertahap sesuai watermark durable, bukan ring
+> publisher penuh. Keduanya dirancang masuk di fase HA.
 
 ---
 
@@ -315,17 +327,17 @@ func (s *Sequencer) sequenceAndRoute(c *types.Command) error {
     s.seq++
     c.Seq = s.seq
     c.TsNanos = s.clock()              // satu-satunya pembacaan jam
-    n := types.EncodeCommandInto(s.payloadBuf[:], *c)
-    if err := s.journal.Append(wal.Record{
-        Seq: uint64(s.seq), TsNanos: c.TsNanos,
-        Type: uint16(c.Type), Payload: s.payloadBuf[:n],
-    }); err != nil {
+    if err := s.journaller.Append(*c); err != nil {
         return err                     // GAGAL journal → JANGAN route, latch fatal
     }
     s.router.OnCommand(*c)             // baru teruskan ke ledger + matching
     return nil
 }
 ```
+
+`journaller.Append` adalah seam §9.4: di mode **sync** ia encode+tulis WAL
+inline; di mode **async** ia push command ke ring Journaller (puluhan ns) lalu
+matching lanjut tanpa menunggu disk.
 
 **Urutan ini krusial:** journal **dulu**, route **kemudian**. Jika `Append`
 gagal, command tidak pernah diterapkan dan tidak ada ack — WAL tetap sumber
@@ -407,6 +419,12 @@ flowchart LR
 - **Fail-stop:** kegagalan `Append`/`Sync` di-*latch* ke `s.fatal`; sesudahnya
   `Step()` jadi no-op dan tak ada ack dirilis. WAL rusak = engine berhenti maju,
   bukan melanjutkan diam-diam.
+
+> Diagram di atas adalah jalur **sync** (fsync inline di goroutine sequencer). Di
+> mode **async** (§9.4) langkah `journal.Sync()` + advance `durableSeq` pindah ke
+> goroutine Journaller terpisah — sequencer cukup push ke ring dan matcher tak
+> pernah beku menunggu fsync. Barrier-nya tetap sama (ack di-gate `DurableSeq`);
+> hanya *siapa* yang mengeksekusi fsync yang berbeda.
 
 ---
 
@@ -625,6 +643,56 @@ batch lebih dulu agar satu record tak pernah melintasi dua segment.
   belum durable → berhenti bersih (bukan error).
 - **CRC buruk sebelum ujung** = `ErrCorrupt`.
 
+### 9.4 Journaller: sync (inline) vs async (off-thread)
+
+Antara sequencer dan WAL ada satu *seam*: **`Journaller`**
+(`internal/sequencer/journaller.go`). Sequencer tak menulis WAL langsung — ia
+menyerahkan command ber-`Seq` ke Journaller. Ada **dua implementasi**, dipilih
+`Config.AsyncJournal` (env `OB_JOURNAL_MODE`, default di `.env.example` = `async`):
+
+| | **SyncJournaller** | **AsyncJournaller** |
+|---|---|---|
+| Append + fsync jalan di | inline, goroutine sequencer | goroutine **terpisah** (core sendiri) |
+| Saat fsync | **matcher beku** menunggu disk | matcher **jalan terus** |
+| Durable ceiling (mesin dev) | ~960k cmd/s | **~1.3M cmd/s** (lewat 1M) |
+| Match-latency p99 @500k | ~77ms (kecekik fsync) | **~10ms** (decoupled) |
+| Kompleksitas | rendah, 1 goroutine | + ring + atomic + barrier, 1 core ekstra |
+| Cocok untuk | tes, replay, beban modest | kejar 1M / beban tinggi |
+
+> **Korektnes identik** — WAL byte-identik, state sama (dibuktikan determinism +
+> differential + fuzz). Ini murni trade-off operasional, bukan benar-salah.
+
+```mermaid
+flowchart LR
+  subgraph SEQG["Goroutine sequencer (core A)"]
+    A["sequenceAndRoute:<br/>seq++, TsNanos"] --> P["journaller.Append(cmd)"]
+    P --> R["router.OnCommand<br/>(match/settle, spekulatif)"]
+  end
+  subgraph JRNG["Goroutine Journaller (core B) — hanya mode ASYNC"]
+    POP["ring.Pop"] --> APP["encode + Append (buffer)"]
+    APP --> CAP{"batch penuh /<br/>ring kosong?"}
+    CAP -->|"ya"| SYNC["Sync() = fsync"]
+    CAP -->|"tidak"| POP
+    SYNC --> WM["atomic: durableSeq = last"]
+    WM --> POP
+  end
+  P -->|"async: SPSC ring FIFO<br/>(spin saat penuh = backpressure)"| POP
+  WM -.->|"atomic load"| GATE["Acks(): rilis Seq <= durableSeq"]
+```
+
+Di mode **async**, `Append` hanya push ke ring (puluhan ns) lalu lanjut matching;
+goroutine Journaller di core B menanggung encode + write + fsync. FIFO ring →
+**urutan byte WAL identik** apa pun timing (determinisme aman). `durableSeq`
+dikabarkan balik lewat satu **atomic**. `Append` *backpressure* (spin) saat ring
+penuh — record **tak pernah** di-drop (WAL = sumber kebenaran). Kegagalan
+Append/Sync di-*latch* jadi fatal lintas-goroutine yang dilihat sequencer
+(`Fatal()`), dan **`DrainJournal`** jadi barrier yang dipakai snapshot/drain
+untuk menunggu consumer mengejar sebelum membaca state durable.
+
+Di mode **sync** (default historis), Journaller = `SyncJournaller`: `Append` dan
+`Sync` jalan inline di goroutine sequencer — persis perilaku §6.5 di bawah. Tak
+ada goroutine/core tambahan.
+
 ---
 
 ## 10. Snapshot & Recovery
@@ -721,16 +789,22 @@ langsung.
 flowchart LR
     ING["ingress ring"] --> SEQ
     REIN["reinject ring"] --> SEQ
-    subgraph CORE0["SATU goroutine / SATU core"]
+    subgraph CORE0["Core A — goroutine kontrol"]
         SEQ["Sequencer"] -->|"inline"| LED["Ledger"]
         LED -->|"inline"| MATCH["Matching semua market"]
         MATCH -.->|"aktivasi stop"| REIN
+        SEQ --> JRL["journaller.Append"]
     end
-    SEQ --> WAL[("WAL")]
+    JRL -->|"sync: inline fsync"| WAL[("WAL")]
+    JRL -.->|"async: ring → core B"| JCORE["Journaller goroutine<br/>(core B): fsync"]
+    JCORE --> WAL
 ```
 
-Paling sederhana, paling deterministik, dan untuk 100k TPS **sudah jauh dari
-jenuh** (satu shard Go sanggup >1 juta match/detik).
+Paling sederhana & deterministik. Catatan: **mode journaling ortogonal** ke
+topologi — bahkan di serial, mode **async** menambah **satu goroutine Journaller
+di core terpisah** (core B) sehingga fsync tak membekukan matcher. Satu shard Go
+sanggup >1 juta match/detik; async journaling menjaga **durable** throughput juga
+di atas 1 juta.
 
 ### 12.2 Topologi Paralel — shard market antar-core
 
@@ -804,27 +878,44 @@ core hanya untuk paralelisme matching per-market.
   di-vendor); **no-op di Darwin** (macOS tak mengekspos API afinitas — mesin dev
   hanya menjalankan tes korektnes di sini).
 
+- **Journaller pinning (mode async):** goroutine Journaller juga busy-spin di
+  core sendiri (`Config.JournalCore`, default tak-pin/`-1` di Darwin).
+
 ```mermaid
 flowchart LR
-    subgraph CPU["Peta core (contoh paralel)"]
+    subgraph CPU["Peta core (contoh paralel + async journaling)"]
         C0["core 0:<br/>goroutine kontrol<br/>(sequencer+ledger), busy"]
         C1["core 1:<br/>worker 0, busy-spin"]
         C2["core 2:<br/>worker 1, busy-spin"]
-        C3["core 3:<br/>housekeeping<br/>(WAL fsync, GC manual)"]
+        C3["core 3:<br/>Journaller (async):<br/>fsync off-thread, busy-spin"]
     end
 ```
+
+Di mode **sync**, core Journaller tak terpakai (fsync inline di core kontrol).
+Di mode **async**, Journaller menempati core sendiri — itulah pertukarannya:
++1 core untuk durable throughput >1M & tail latency matcher µs.
 
 ---
 
 ## 13. Performa & Zero-Alloc
 
-Target rancangan (lihat design doc §1, §14, §18):
+Target & hasil terukur (mesin dev: Apple M2, Darwin — pinning no-op):
 
-| Metrik | Target |
-|---|---|
-| Throughput berkelanjutan | ≥ 100k cmd/detik (cari titik jenuh) |
-| Latency internal p50 / p99 / p99.9 | ≤ 2µs / ≤ 10µs / ≤ 50µs |
-| Alokasi di hot path | **0 B/op** (diverifikasi `-benchmem`) |
+| Metrik | Target | Terukur |
+|---|---|---|
+| Matching ceiling (no-op journal) | — | ~1.4M cmd/detik |
+| **Durable throughput** | **≥ 1 juta cmd/detik** | **sync ~960k · async ~1.3M** ✅ |
+| Alokasi di hot path | **0 B/op** | 0 allocs/op (gated CI) |
+
+**Dua SLO terpisah** (diukur `cmd/loadtest`, open-loop coordinated-omission-correct):
+
+| @ 500k TPS | sync | async |
+|---|---|---|
+| *internal match latency* p99 (intended→matched) | ~77ms (kecekik fsync) | **~10ms** |
+| *durable-ack latency* p99 (intended→WAL durable) | ~87ms | **~16ms** |
+
+Inilah inti nilai async: matcher **decoupled** dari fsync. p50 match async = 705ns
+vs sync 305µs di 500k TPS. (Sync tetap lebih sederhana & cukup di beban modest.)
 
 Teknik yang menjaganya:
 
@@ -833,8 +924,8 @@ Teknik yang menjaganya:
 - **Arena pra-alokasi + free-list** untuk order; semua `make`/`reserve` di
   *startup*, hot path nol-alokasi.
 - **SPSC ring** lock-free, cache-line padded, entry dipakai ulang.
-- **Buffer dipakai ulang** di sequencer (`payloadBuf`) dan matcher (`fills`,
-  `filled`).
+- **Buffer dipakai ulang** di Journaller (`payloadBuf` encode) dan matcher
+  (`fills`, `filled`); `Append` async (push ke ring) tetap 0 alloc.
 - **GC off + pin core + busy-spin** saat sesi ukur.
 
 CI menggerbang zero-alloc lewat `*_bench_test.go` pada `internal/spsc`,
@@ -857,7 +948,9 @@ internal/spsc       # SPSC ring lock-free (generic + alias konkret)
 internal/orderbook  # book per-market: arena + intrusive FIFO + price levels
 internal/matching   # price-time matching, 8 perilaku order type, tabel stop
 internal/balance    # ledger single-writer (available/reserved), event bertag
-internal/sequencer  # otoritas urutan + fan-in MPSC + journaling + durable-ack barrier
+internal/sequencer  # otoritas urutan + fan-in MPSC + durable-ack barrier;
+                    #   Journaller seam: SyncJournaller (inline) & AsyncJournaller
+                    #   (fsync off-thread, jalur 1M durable)
 internal/wal        # WAL segmented (record+CRC), group-commit, replay
 internal/market     # perakitan engine: serial & paralel; Snapshot/Restore/Recover
 internal/platform   # GC off, pin core (build-tagged per OS)

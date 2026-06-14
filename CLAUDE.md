@@ -7,9 +7,11 @@ nearest package-level `CLAUDE.md` before editing code in that package.
 
 A deterministic, event-sourced **spot order-book matching engine** in Go
 (`module github.com/yanuar-ar/order-book`, Go 1.25+). Single-node: WAL +
-snapshot + replay for durability. Multi-market (sharded), shared balance
-authority, price-time (FIFO) matching, eight order types (Limit, Market, IOC,
-FOK, Post-Only, Iceberg, Stop, Stop-Limit), configurable maker/taker fees.
+snapshot + replay for durability, with a **`Journaller` seam** — sync (inline
+fsync) or async (fsync on a dedicated goroutine, the path to **1M durable TPS**),
+selected by `OB_JOURNAL_MODE`. Multi-market (sharded), shared balance authority,
+price-time (FIFO) matching, eight order types (Limit, Market, IOC, FOK,
+Post-Only, Iceberg, Stop, Stop-Limit), configurable maker/taker fees.
 
 > Clustering/failover and backup/DR are **out of scope for v1**.
 
