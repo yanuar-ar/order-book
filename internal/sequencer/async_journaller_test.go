@@ -184,6 +184,53 @@ func TestSequencerHaltsOnAsyncJournallerFatal(t *testing.T) {
 	}
 }
 
+// ---- U4: DrainJournal barriers until the async consumer is durable ----
+
+func TestSequencerDrainJournalWaitsForAsyncDurability(t *testing.T) {
+	j := &fakeJournal{}
+	// Huge batch cap → the consumer only flushes when the ring drains, so
+	// DurableSeq genuinely lags Seq until DrainJournal forces the wait.
+	aj := NewAsyncJournaller(j, 0, 1<<20, -1)
+	defer aj.Close()
+
+	in := spsc.NewCommand(64)
+	s := New(Config{Inputs: []*spsc.RingCommand{in}, Journaller: aj, Router: &fakeRouter{}, Clock: func() int64 { return 1 }})
+	const n = 20
+	for i := 1; i <= n; i++ {
+		in.Push(cmd(types.OrderID(i)))
+	}
+	for s.Step() { // sequence every command into the journal ring
+	}
+	if err := s.DrainJournal(); err != nil {
+		t.Fatalf("DrainJournal: %v", err)
+	}
+	if s.DurableSeq() != s.Seq() {
+		t.Fatalf("after DrainJournal durableSeq=%d, want Seq=%d", s.DurableSeq(), s.Seq())
+	}
+	if s.DurableSeq() != n {
+		t.Fatalf("durableSeq=%d, want %d", s.DurableSeq(), n)
+	}
+}
+
+func TestSequencerDrainJournalSurfacesAsyncFatal(t *testing.T) {
+	boom := errors.New("drain-time io down")
+	j := &syncFailJournal{err: boom}
+	aj := NewAsyncJournaller(j, 0, 1<<20, -1) // flush only on ring-drain → fails at DrainJournal
+	defer aj.Close()
+
+	in := spsc.NewCommand(16)
+	s := New(Config{Inputs: []*spsc.RingCommand{in}, Journaller: aj, Router: &fakeRouter{}, Clock: func() int64 { return 1 }})
+	in.Push(cmd(1))
+	for s.Step() {
+	}
+	if err := s.DrainJournal(); !errors.Is(err, boom) {
+		t.Fatalf("DrainJournal = %v, want %v", err, boom)
+	}
+	if err := s.Fatal(); !errors.Is(err, boom) {
+		t.Fatalf("Fatal after DrainJournal = %v, want %v (must latch for drain-then-check callers)", err, boom)
+	}
+}
+
 // ---- Zero-alloc: Append must not allocate on the producer hot path ----
 
 func BenchmarkAsyncAppend(b *testing.B) {

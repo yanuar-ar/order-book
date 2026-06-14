@@ -118,6 +118,23 @@ func (s *Sequencer) Seq() types.Seq { return s.seq }
 // (acks) at or below this watermark is safe to release; above it is speculative.
 func (s *Sequencer) DurableSeq() types.Seq { return s.journaller.DurableSeq() }
 
+// DrainJournal blocks until the journaller has made every appended command
+// durable (DurableSeq catches up to the last appended Seq). For the async
+// journaller this waits for its consumer to fsync; for the sync journaller it
+// flushes inline. It must be called only when the input rings are quiesced (no
+// new commands are being sequenced). A failure latches fatal so a drain-then-
+// check caller (the snapshotter) observes it via Fatal().
+func (s *Sequencer) DrainJournal() error {
+	if s.fatal != nil {
+		return s.fatal
+	}
+	if err := s.journaller.Drain(); err != nil {
+		s.fatal = err
+		return err
+	}
+	return nil
+}
+
 // setFlushCap overrides the group-commit batch ceiling. Test-only seam (used to
 // prove the WAL byte stream and Seq assignment are invariant to flush cadence).
 func (s *Sequencer) setFlushCap(n int) {

@@ -231,10 +231,12 @@ func (pe *ParallelEngine) Submit(c types.Command) bool { return pe.ingress.Push(
 // to workers and blocking for results.
 func (pe *ParallelEngine) Step() bool { return pe.seq.Step() }
 
-// Drain steps until no control work remains.
+// Drain steps until no control work remains, then waits for the journaller to
+// make every appended command durable so durableSeq == Seq.
 func (pe *ParallelEngine) Drain() {
 	for pe.seq.Step() {
 	}
+	_ = pe.seq.DrainJournal()
 }
 
 // Ledger exposes the balance ledger (read after Drain/Close for consistency).
