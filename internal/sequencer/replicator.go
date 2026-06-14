@@ -36,6 +36,27 @@ type Replicator interface {
 	Close() error
 }
 
+// StandbyLink abstracts the transport between the primary and a hot standby. It
+// is the seam the AsyncReplicator drives; the in-process implementation (market
+// package) applies commands directly to a standby Engine, and a network
+// implementation would put bytes on a wire — both behind this interface.
+//
+// Send delivers one command to the standby. AckedSeq is the highest Seq the
+// standby has durably applied (the source of the replicated watermark). Fetch
+// backfills a gap: when the live ring overflowed and the replicator dropped a
+// command (it is still in the WAL), the consumer asks the link for the missing
+// durable commands after a watermark and streams them — so records are never
+// lost from the log even though the live ring is lossy under backpressure.
+type StandbyLink interface {
+	Send(c types.Command) error
+	AckedSeq() types.Seq
+	// Fetch returns durable commands with Seq > afterSeq, in order, bounded to the
+	// primary's durableSeq (a record not yet fsynced is not yet eligible).
+	Fetch(afterSeq types.Seq) ([]types.Command, error)
+	Fatal() error
+	Close() error
+}
+
 // NopReplicator is the "off" replicator: it streams nothing and reports an
 // +infinite replicated watermark, so min(durableSeq, ReplicatedSeq) == durableSeq
 // and the ack gate is unchanged. It is the default, like SyncJournaller is the
