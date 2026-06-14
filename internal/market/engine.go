@@ -216,6 +216,11 @@ type Engine struct {
 	// journaller); Close stops it. Durability is forced through the sequencer
 	// (SyncJournal), not this handle.
 	journaller sequencer.Journaller
+	// replicator streams to the hot standby (nil when replication is off); Close
+	// stops it. standby is the shadow engine it drives (nil when off), exposed for
+	// fingerprint/invariant comparison and promotion.
+	replicator sequencer.Replicator
+	standby    *Standby
 	cfg        Config // retained for the snapshot header (scales, markets)
 }
 
@@ -256,6 +261,10 @@ type Config struct {
 	// disables, the default).
 	ReplicationRing uint64
 	ReplicationCore int
+	// WALDir is the primary's WAL directory, used by the in-process replicator
+	// link to backfill overflow gaps (records the live ring dropped under
+	// backpressure are re-read from the WAL). Optional; empty disables backfill.
+	WALDir string
 	// SuppressStops installs a no-op activation sink. Set during replay, where
 	// stop activations are read from the WAL rather than regenerated.
 	SuppressStops bool
@@ -302,11 +311,13 @@ func NewEngine(cfg Config) *Engine {
 	ingress := spsc.NewCommand(cfg.RingSize)
 	reinject := spsc.NewCommand(cfg.RingSize)
 	journaller := buildJournaller(cfg)
+	replicator, standby := buildReplicator(cfg)
 	seq := sequencer.New(sequencer.Config{
 		Reinject:   reinject,
 		Inputs:     []*spsc.RingCommand{ingress},
 		Journal:    cfg.Journal,
 		Journaller: journaller, // nil -> sequencer wraps Journal in a SyncJournaller
+		Replicator: replicator, // nil -> sequencer uses NopReplicator
 		Router:     core,
 		Clock:      cfg.Clock,
 		FlushCap:   cfg.FlushCap,
@@ -318,7 +329,7 @@ func NewEngine(cfg Config) *Engine {
 	for _, s := range impls {
 		s.SetSink(sink)
 	}
-	return &Engine{seq: seq, core: core, ingress: ingress, impls: impls, journaller: journaller, cfg: cfg}
+	return &Engine{seq: seq, core: core, ingress: ingress, impls: impls, journaller: journaller, replicator: replicator, standby: standby, cfg: cfg}
 }
 
 // buildJournaller returns an AsyncJournaller when cfg.AsyncJournal is set, else
@@ -339,11 +350,21 @@ func buildJournaller(cfg Config) sequencer.Journaller {
 // must be called before the host closes the underlying Journal. A no-op for the
 // sync journaller. Idempotent only once — call exactly once at shutdown.
 func (e *Engine) Close() error {
+	var err error
 	if e.journaller != nil {
-		return e.journaller.Close()
+		err = e.journaller.Close()
 	}
-	return nil
+	if e.replicator != nil {
+		if rerr := e.replicator.Close(); rerr != nil && err == nil {
+			err = rerr
+		}
+	}
+	return err
 }
+
+// Standby returns the hot-standby shadow engine (nil when replication is off),
+// for fingerprint/invariant comparison and promotion.
+func (e *Engine) Standby() *Standby { return e.standby }
 
 // balanceConfig derives the ledger config from the engine config.
 func balanceConfig(cfg Config) balance.Config {
@@ -379,6 +400,7 @@ func (e *Engine) Drain() {
 	for e.seq.Step() {
 	}
 	_ = e.seq.DrainJournal()
+	_ = e.seq.DrainReplication() // make the standby catch up (journal drained first)
 }
 
 // Ledger exposes the balance ledger (read access for invariants/tests).

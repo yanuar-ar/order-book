@@ -32,6 +32,8 @@ type ParallelEngine struct {
 
 	workers    []*worker
 	journaller sequencer.Journaller // async journaller handle (nil for sync); Close stops it
+	replicator sequencer.Replicator // hot-standby replicator (nil for off); Close stops it
+	standby    *Standby             // shadow engine the replicator drives (nil for off)
 	stop       atomic.Bool
 	wg         sync.WaitGroup
 }
@@ -207,11 +209,13 @@ func NewParallelEngine(cfg Config, groups [][]types.MarketID) *ParallelEngine {
 
 	pe.core = &Core{shards: coreShards, ledger: ledger, open: make(map[types.OrderID]openOrder, 1024), filters: cfg.Filters, qtyScale: cfg.QtyScale}
 	pe.journaller = buildJournaller(cfg)
+	pe.replicator, pe.standby = buildReplicator(cfg)
 	pe.seq = sequencer.New(sequencer.Config{
 		Reinject:   reinject,
 		Inputs:     []*spsc.RingCommand{ingress},
 		Journal:    cfg.Journal,
 		Journaller: pe.journaller,
+		Replicator: pe.replicator,
 		Router:     pe.core,
 		Clock:      cfg.Clock,
 		FlushCap:   cfg.FlushCap,
@@ -240,6 +244,7 @@ func (pe *ParallelEngine) Drain() {
 	for pe.seq.Step() {
 	}
 	_ = pe.seq.DrainJournal()
+	_ = pe.seq.DrainReplication()
 }
 
 // Ledger exposes the balance ledger (read after Drain/Close for consistency).
@@ -291,4 +296,10 @@ func (pe *ParallelEngine) Close() {
 	if pe.journaller != nil {
 		_ = pe.journaller.Close()
 	}
+	if pe.replicator != nil {
+		_ = pe.replicator.Close()
+	}
 }
+
+// Standby returns the hot-standby shadow engine (nil when replication is off).
+func (pe *ParallelEngine) Standby() *Standby { return pe.standby }
