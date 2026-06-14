@@ -16,6 +16,7 @@ import (
 type Standby struct {
 	eng         *Engine
 	lastApplied types.Seq
+	epoch       uint64 // highest leadership term held; Promote increments it
 }
 
 // newStandby builds the shadow engine from the same config as the primary, but
@@ -32,19 +33,44 @@ func newStandby(cfg Config) *Standby {
 	return &Standby{eng: NewEngine(scfg)}
 }
 
-// apply delivers one replicated command to the shadow engine, guarding against
-// duplicate / already-applied Seqs (idempotency). In-process delivery is
-// contiguous, so the common case is Seq == lastApplied+1.
-func (s *Standby) apply(c types.Command) {
+// apply delivers one replicated command to the shadow engine. It fences a
+// stale-epoch record (a backwards leadership term — a zombie old primary's write
+// after this node promoted) and guards against duplicate / already-applied Seqs
+// (ApplyJournaled is not idempotent). It reports whether the command was applied.
+// In-process delivery is contiguous, so the common case is Seq == lastApplied+1.
+func (s *Standby) apply(c types.Command) bool {
+	if c.Epoch < s.epoch {
+		return false // fenced: stale leadership term (no state mutation)
+	}
 	if c.Seq <= s.lastApplied {
-		return // already applied — drop the duplicate
+		return false // already applied — drop the duplicate
+	}
+	if c.Epoch > s.epoch {
+		s.epoch = c.Epoch // adopt a newer term streamed from the primary
 	}
 	s.eng.ApplyJournaled(c)
 	s.lastApplied = c.Seq
+	return true
 }
 
 // Seq is the standby's applied watermark (the source of the replicated ack).
 func (s *Standby) Seq() types.Seq { return s.lastApplied }
+
+// Epoch is the leadership term the standby holds (fences anything below it).
+func (s *Standby) Epoch() uint64 { return s.epoch }
+
+// Promote turns the standby into the live primary: it increments the leadership
+// term (so a revived old primary's records are fenced), primes the sequencer to
+// the applied watermark and the new term, and re-enables stop activations (they
+// were suppressed while shadowing, exactly like recovery). It returns the now-live
+// engine. The caller must have stopped replicating into this standby first.
+func (s *Standby) Promote() *Engine {
+	s.epoch++
+	s.eng.SetSeq(s.lastApplied)
+	s.eng.SetEpoch(s.epoch)
+	s.eng.EnableStops()
+	return s.eng
+}
 
 // Engine exposes the shadow engine for fingerprint/invariant comparison and, on
 // promotion, to become the live primary.
