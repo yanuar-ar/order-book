@@ -13,9 +13,13 @@ directly to the WAL and copy through SPSC rings without allocation.
 - `money.go` — integer fixed-point arithmetic: `MulDiv` (128-bit intermediate
   via `math/bits`), `Notional`, `Fee`. The `ok` return is an overflow signal —
   callers MUST reject the operation when `ok == false`, never wrap.
-- `codec.go` — `EncodeCommand`/`DecodeCommand`: stable little-endian byte
-  layout. **The byte layout is a durability contract** — changing it breaks
-  replay of existing WALs.
+- `codec.go` — command WAL codec. `EncodeCommandInto(dst, c)` is the hand-rolled,
+  **zero-alloc** little-endian encoder used on the sequencer hot path (writes into
+  a reusable buffer; `CommandSize` bytes, packed, no padding). `EncodeCommand` is
+  an allocating wrapper for off-hot-path callers; `DecodeCommand` stays reflective
+  (replay isn't hot). **The byte layout is a durability contract** — changing it
+  breaks replay of existing WALs; `EncodeCommandInto` is byte-identical to the
+  former reflective encoder, guarded by a differential + fuzz test.
 
 ## Constraints
 

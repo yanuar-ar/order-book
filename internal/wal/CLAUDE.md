@@ -7,6 +7,14 @@ Clustering/failover and backup/DR are out of scope for v1.
 
 - `wal.go` — `Writer`: appends records to segmented log files (`%06d.wal`,
   default 1 GiB/segment). Used by a **single writer goroutine** (the sequencer).
+  `Append` frames into a reusable buffer and **buffers the batch in memory** (no
+  syscall); `Sync` flushes it with **one `write` + one `fsync`** (group-commit
+  batches both syscalls, not just the fsync). Buffering until `Sync` is safe under
+  the durable-ack barrier — nothing is durable until the watermark advances on
+  `Sync`. `Append` does not retain `Record.Payload` past the call (it copies),
+  and is zero-alloc in steady state (gated by `TestAppendZeroAlloc`). Batch size
+  is the sequencer's `flushCap`, which governs durable throughput vs durable-ack
+  latency.
 - `record.go` — on-disk record framing.
 - `snapshot.go` — point-in-time state snapshot (book + ledger).
 - `replay.go` — replay records (optionally from a snapshot) to rebuild state.

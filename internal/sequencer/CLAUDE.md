@@ -25,14 +25,20 @@ exposed before its WAL bytes are durable.
   `DurableSeq()` exposes it and the market layer gates `Acks()` on it.
 - **Drain-driven group-commit.** A flush (`Sync` → advance `durableSeq` → release
   pending acks) fires when the input ring drains with records pending, or when an
-  unsynced batch reaches `defaultFlushCap`. `flush()` captures the last-appended
-  `Seq` **before** `Sync` so the watermark never over-claims. Every sequenced
-  record — reinject (stop activation) path included — increments the unsynced
-  count, so a stop activation's ack is never stranded above `durableSeq`.
+  unsynced batch reaches the flush cap (`Config.FlushCap`, default
+  `defaultFlushCap`). `flush()` captures the last-appended `Seq` **before** `Sync`
+  so the watermark never over-claims. Every sequenced record — reinject (stop
+  activation) path included — increments the unsynced count, so a stop
+  activation's ack is never stranded above `durableSeq`. The command payload is
+  encoded into a reusable per-sequencer buffer (`EncodeCommandInto`), so
+  journaling allocates nothing on the hot path (gated by `TestStepZeroAlloc`).
 - **Output-side only.** `durableSeq`, the unsynced counter, and flush timing are
   never journaled and never affect `Seq`, timestamps, or fill order — replay is
-  byte-identical regardless of flush cadence. `flushCap` is an unexported
-  constant (test-only `setFlushCap` seam), not a config knob.
+  byte-identical regardless of flush cadence. `FlushCap` governs durable
+  throughput vs durable-ack latency: bigger batches amortize the WAL `write`+`fsync`
+  over more commands. The inline single-thread durable ceiling is the no-op
+  ceiling minus the sequencer's own I/O time (~980k cmd/s on the dev machine);
+  clearing 1M needs edge journalling (fsync off the sequencer thread), deferred.
 - **Fail-stop.** A non-nil `Append`/`Sync` error latches a terminal `fatal`:
   `Step` becomes a no-op, `Run` exits, no pending ack is released, and the host
   (`cmd/engine`) / snapshotter surface it via `Fatal()`. The WAL is the source of
