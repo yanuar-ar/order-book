@@ -21,6 +21,7 @@ import (
 	"math/rand"
 	"os"
 	"runtime"
+	"runtime/pprof"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -48,6 +49,7 @@ func main() {
 	durable := flag.Bool("durable", false, "journal to a real WAL (group-commit fsync) instead of the no-op journal — the honest durable ceiling")
 	walDir := flag.String("wal", "", "WAL directory for -durable (default: a temp dir, removed on exit)")
 	flushCap := flag.Int("flushcap", 0, "group-commit batch ceiling (commands per fsync; 0 = engine default). Bigger amortizes fsync harder on the durable path")
+	cpuprofile := flag.String("cpuprofile", "", "write a CPU profile to this path for the measured window")
 	flag.Parse()
 
 	var groups [][]types.MarketID
@@ -107,6 +109,20 @@ func main() {
 
 	displayStop := make(chan struct{})
 	go harness.DisplayLoop(&framePtr, displayStop)
+
+	if *cpuprofile != "" {
+		f, err := os.Create(*cpuprofile)
+		if err != nil {
+			fmt.Println("create cpuprofile:", err)
+			return
+		}
+		defer f.Close()
+		if err := pprof.StartCPUProfile(f); err != nil {
+			fmt.Println("start cpuprofile:", err)
+			return
+		}
+		defer pprof.StopCPUProfile()
+	}
 
 	start := time.Now()
 

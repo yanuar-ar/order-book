@@ -13,6 +13,10 @@ FOK, Post-Only, Iceberg, Stop, Stop-Limit), configurable maker/taker fees.
 
 > Clustering/failover and backup/DR are **out of scope for v1**.
 
+For a runtime overview with diagrams (LMAX mapping, SPSC ring producers/
+consumers, the sequencer loop, balance authority, and the serial vs parallel
+multi-core topology), start with `ARCHITECTURE.md` at the repo root.
+
 Authoritative specs live in `docs/`:
 - `docs/designs/spot-orderbook-engine-design.md` — architecture.
 - `docs/designs/invariant-fuzz-testing-guide.md` — **the correctness contract**
