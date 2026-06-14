@@ -23,8 +23,11 @@ func sampleCommands() []Command {
 		{Type: CmdAmend, Market: 0, Account: 7, OrderID: 9, Price: 50, Qty: 3},
 		{Type: CmdDeposit, Account: 11, Asset: 2, Amount: 1_000_000},
 		{Type: CmdWithdraw, Account: 11, Asset: 2, Amount: 500},
-		// Boundary values: max-width fields and every enum at its max.
-		{Seq: ^Seq(0), TsNanos: 1<<62 - 1, Type: CmdWithdraw, Market: ^MarketID(0), Account: ^AccountID(0), OrderID: ^OrderID(0), Side: Sell, OrdType: StopLimit, Tif: FOK, Flags: FlagPostOnly | FlagIceberg, Price: -1 << 62, StopPrice: 1<<62 - 1, Qty: -1, DisplayQty: 1<<62 - 1, Asset: ^AssetID(0), Amount: -1, ClientReqID: ^uint64(0), ClientTsNanos: -1},
+		// Replication control records + a non-zero Epoch envelope.
+		{Seq: 9, Type: CmdDegradeToSolo, Epoch: 3},
+		{Seq: 10, Type: CmdRearm, Epoch: 3},
+		// Boundary values: max-width fields and every enum at its max (incl. Epoch).
+		{Seq: ^Seq(0), TsNanos: 1<<62 - 1, Type: CmdWithdraw, Market: ^MarketID(0), Account: ^AccountID(0), OrderID: ^OrderID(0), Side: Sell, OrdType: StopLimit, Tif: FOK, Flags: FlagPostOnly | FlagIceberg, Price: -1 << 62, StopPrice: 1<<62 - 1, Qty: -1, DisplayQty: 1<<62 - 1, Asset: ^AssetID(0), Amount: -1, ClientReqID: ^uint64(0), ClientTsNanos: -1, Epoch: ^uint64(0)},
 	}
 }
 

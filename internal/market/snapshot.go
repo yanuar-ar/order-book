@@ -12,7 +12,10 @@ import (
 
 // snapshotVersion is the snapshot format version. Bump it on any change to the
 // section layout — the format is a durability contract, like the WAL.
-const snapshotVersion uint16 = 1
+// v2: added the secReplication section (degrade gate mode) and the epoch field in
+// the wal container header; a v1 snapshot is now ErrSnapshotIncompatible (Restore
+// falls back to full WAL replay).
+const snapshotVersion uint16 = 2
 
 // Snapshot section indices within the wal container.
 const (

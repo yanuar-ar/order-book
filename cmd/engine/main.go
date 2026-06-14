@@ -52,6 +52,7 @@ func main() {
 		JournalRing:     cfg.JournalRing,
 		ReplicationMode: cfg.ReplicationMode,
 		ReplicationRing: cfg.ReplicationRing,
+		WALDir:          cfg.WALPath, // so the standby can backfill overflow gaps from the WAL
 	}
 	eng, err := market.Recover(mcfg, cfg.WALPath, cfg.SnapshotPath, func(format string, args ...any) {
 		log.Warn("recovery fallback", slog.String("detail", fmt.Sprintf(format, args...)))

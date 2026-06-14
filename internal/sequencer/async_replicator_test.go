@@ -158,6 +158,34 @@ func assertContiguous(t *testing.T, applied []types.Command, n int) {
 	}
 }
 
+// nopLink is a non-allocating StandbyLink for the zero-alloc gate: Send/Fetch do
+// not allocate, so the only allocations the gate could see are producer-side.
+type nopLink struct{ acked atomic.Uint64 }
+
+func (l *nopLink) Send(c types.Command) error               { l.acked.Store(uint64(c.Seq)); return nil }
+func (l *nopLink) AckedSeq() types.Seq                      { return types.Seq(l.acked.Load()) }
+func (l *nopLink) Fetch(types.Seq) ([]types.Command, error) { return nil, nil }
+func (l *nopLink) Fatal() error                             { return nil }
+func (l *nopLink) Close() error                             { return nil }
+
+// TestReplicateZeroAlloc gates the producer-side Replicate hand-off at zero
+// allocations (the CI alloc gate for the replicator hot path, mirroring
+// TestStepZeroAlloc). The ring is sized so the run never overflows into Fetch.
+func TestReplicateZeroAlloc(t *testing.T) {
+	r := NewAsyncReplicator(&nopLink{}, 1<<16, -1)
+	defer r.Close()
+	c := repCmd(1)
+	seq := uint64(0)
+	allocs := testing.AllocsPerRun(1000, func() {
+		seq++
+		c.Seq = types.Seq(seq)
+		_ = r.Replicate(c)
+	})
+	if allocs != 0 {
+		t.Fatalf("Replicate allocates %.1f/op, want 0", allocs)
+	}
+}
+
 // BenchmarkReplicate gates the producer-side hand-off at zero allocations.
 func BenchmarkReplicate(b *testing.B) {
 	link := &fakeLink{wal: walOf(b.N + 1)}
