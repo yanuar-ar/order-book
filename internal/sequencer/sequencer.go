@@ -250,13 +250,13 @@ func (s *Sequencer) Step() bool {
 		// journaller always reports nil here, so this costs it nothing.
 		s.fatal = err
 		return did
-	} else if err := s.replicator.Fatal(); err != nil {
-		// Same for a replicator that died on its consumer goroutine: in sync mode
-		// the ack gate is frozen at replicatedSeq, so halt rather than leave the
-		// engine silently un-replicated. NopReplicator always reports nil here.
-		s.fatal = err
-		return did
 	}
+	// A replicator fatal must NOT halt the engine: the replicator is not the
+	// source of truth (the WAL is), and halting would kill the degrade-to-solo
+	// rescue path in sync mode and take the primary down over a non-critical
+	// backup in async mode. Its death freezes replicatedSeq, which stalls
+	// sync-mode acks via the gate (recoverable by an operator degrade-to-solo);
+	// async/off are unaffected. It is observable via ReplicatorFatal().
 	if s.unsynced > 0 && s.unsynced >= s.flushCap {
 		// Batch ceiling reached under load: amortize the fsync (the LMAX
 		// batching effect). flush() zeroes unsynced, so this fires at most once.
@@ -282,6 +282,12 @@ func (s *Sequencer) flush() error {
 // Fatal returns the latched terminal WAL-durability failure, or nil. The host
 // run loop checks this after each Step and halts on a non-nil result.
 func (s *Sequencer) Fatal() error { return s.fatal }
+
+// ReplicatorFatal returns a latched replication failure (a dead standby link), or
+// nil. Unlike Fatal it does NOT stop the engine — it is an operator signal: in
+// sync mode the ack gate is already stalling on the frozen replicatedSeq, and the
+// fix is an operator degrade-to-solo, which requires the engine to keep running.
+func (s *Sequencer) ReplicatorFatal() error { return s.replicator.Fatal() }
 
 // Run loops Step until stop is closed or a fatal latches (busy-spin). Used by
 // the assembled engine.

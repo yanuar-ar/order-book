@@ -86,6 +86,7 @@ func main() {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
+		replicatorReported := false
 		for {
 			select {
 			case <-stop:
@@ -98,6 +99,13 @@ func main() {
 					// fall through to graceful shutdown.
 					log.Error("engine fail-stop: WAL durability failure", slog.Any("err", err))
 					return
+				}
+				if err := eng.ReplicatorFatal(); err != nil && !replicatorReported {
+					// The standby link died: the primary stays up (the WAL is intact).
+					// In sync mode acks are now stalling; an operator must degrade-to-
+					// solo to resume releasing them. Log once, do not stop.
+					log.Error("replication fail: standby link down — degrade-to-solo to resume acks", slog.Any("err", err))
+					replicatorReported = true
 				}
 				if _, err := snap.Maybe(eng, int64(eng.Seq())); err != nil {
 					log.Error("snapshot failed", slog.Any("err", err))

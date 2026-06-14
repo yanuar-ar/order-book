@@ -52,6 +52,76 @@ func TestEngineStateMachine(t *testing.T) {
 	})
 }
 
+// TestReplicatedEngineStateMachine drives the rapid-generated command stream
+// through a sync-replicating engine (the production posture) and asserts, after
+// every step, that the primary still matches the oracle AND the hot standby has
+// converged (INV-REP-01/02/03) — plus occasional degrade-to-solo / re-arm flips.
+// rapid shrinks any divergence to a minimal repro. This is the replication path's
+// share of the mandated rapid layer.
+func TestReplicatedEngineStateMachine(t *testing.T) {
+	rapid.Check(t, func(rt *rapid.T) {
+		cfg := engineCfg()
+		cfg.AsyncJournal = true
+		cfg.JournalCore = -1
+		cfg.ReplicationMode = "sync"
+		cfg.ReplicationCore = -1
+		e := market.NewEngine(cfg)
+		defer e.Close()
+		mod := refmodel.New(modelCfg())
+
+		deps, net := standardPrelude()
+		for _, c := range deps {
+			e.Submit(c)
+			mod.Apply(c)
+		}
+		e.Drain()
+		_ = e.DrainStandby()
+
+		issued := []types.OrderID{}
+		var id types.OrderID = 1000
+		steps := rapid.IntRange(1, 40).Draw(rt, "steps")
+		for i := 0; i < steps; i++ {
+			// Occasionally flip the replication gate mode; degrade/re-arm are no-ops
+			// to book/ledger so the oracle is unaffected, but they exercise the gate
+			// reconstruction and must keep the standby fingerprint-equal.
+			switch rapid.IntRange(0, 9).Draw(rt, "repOp") {
+			case 0:
+				e.Submit(types.Command{Type: types.CmdDegradeToSolo})
+				e.Drain()
+				_ = e.DrainStandby()
+			case 1:
+				e.Submit(types.Command{Type: types.CmdRearm})
+				e.Drain()
+				_ = e.DrainStandby()
+			}
+
+			c := drawCommand(rt, &id, &issued)
+			c.Seq = types.Seq(i + 1)
+			if c.Type == types.CmdWithdraw {
+				before := e.Ledger().Available(c.Account, c.Asset)
+				e.Submit(c)
+				e.Drain()
+				net[c.Asset] -= before - e.Ledger().Available(c.Account, c.Asset)
+			} else {
+				e.Submit(c)
+				e.Drain()
+			}
+			_ = e.DrainStandby()
+			mod.Apply(c)
+
+			if eng, ref := engineState(e).Canonical(), mod.Snapshot().Canonical(); eng != ref {
+				rt.Fatalf("state diverged (cmd %+v):\n--- engine ---\n%s\n--- model ---\n%s", c, eng, ref)
+			}
+			if err := CheckAllInvariants(e, net); err != nil {
+				rt.Fatalf("invariant violated (cmd %+v): %v", c, err)
+			}
+			if err := CheckReplicationInvariants(e); err != nil {
+				rt.Fatalf("replication invariant violated (cmd %+v): %v", c, err)
+			}
+		}
+	})
+}
+
 func drawCommand(rt *rapid.T, id *types.OrderID, issued *[]types.OrderID) types.Command {
 	kind := rapid.IntRange(0, 9).Draw(rt, "kind")
 	if len(*issued) > 0 && kind == 0 {

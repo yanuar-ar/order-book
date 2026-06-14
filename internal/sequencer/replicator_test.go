@@ -74,9 +74,11 @@ func TestNopReplicatorReleaseEqualsDurable(t *testing.T) {
 	}
 }
 
-// Negative: a replicator that dies on its own goroutine halts the idle
-// sequencer, so no further output is released above the frozen watermark.
-func TestSequencerHaltsOnReplicatorFatal(t *testing.T) {
+// Negative: a replicator that dies does NOT halt the engine (the replicator is
+// not the source of truth). The engine keeps sequencing — so an operator
+// degrade-to-solo can still be processed to rescue the stalled acks — and the
+// failure is observable via ReplicatorFatal() rather than Fatal().
+func TestReplicatorFatalDoesNotHaltEngine(t *testing.T) {
 	in := spsc.NewCommand(16)
 	in.Push(cmd(1))
 	rep := &stubReplicator{}
@@ -85,16 +87,22 @@ func TestSequencerHaltsOnReplicatorFatal(t *testing.T) {
 	drainSteps(s) // cmd1 routed + flushed; now idle
 
 	rep.fatal = errors.New("standby link dead")
-	s.Step() // idle: observes replicator.Fatal()
-	if s.Fatal() == nil {
-		t.Fatal("expected fatal latched from replicator death")
+	s.Step() // idle tick observes the dead replicator
+
+	if s.Fatal() != nil {
+		t.Fatalf("Fatal() = %v, want nil (a dead replicator must not halt the engine)", s.Fatal())
 	}
+	if s.ReplicatorFatal() == nil {
+		t.Fatal("expected ReplicatorFatal() to surface the standby link death")
+	}
+	// The engine keeps running: a subsequent command (e.g. a degrade-to-solo) is
+	// still sequenced and routed.
 	in.Push(cmd(2))
-	if s.Step() {
-		t.Fatal("Step did work after fatal latched")
+	if !s.Step() {
+		t.Fatal("Step did no work after a replicator fatal — engine wrongly halted")
 	}
-	if len(r.cmds) != 1 {
-		t.Fatalf("routed %d commands, want 1 (cmd2 never routed after fatal)", len(r.cmds))
+	if len(r.cmds) != 2 {
+		t.Fatalf("routed %d commands, want 2 (the engine keeps sequencing)", len(r.cmds))
 	}
 }
 

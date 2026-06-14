@@ -494,6 +494,11 @@ func (e *Engine) Seq() types.Seq { return e.seq.Seq() }
 // run loop checks this after each Step; the snapshotter checks it after Drain.
 func (e *Engine) Fatal() error { return e.seq.Fatal() }
 
+// ReplicatorFatal returns a latched standby-replication failure (or nil). It does
+// not halt the engine; the host should log it so an operator can intervene
+// (degrade-to-solo).
+func (e *Engine) ReplicatorFatal() error { return e.seq.ReplicatorFatal() }
+
 // DurableSeq returns the highest Seq whose WAL bytes have been fsynced.
 func (e *Engine) DurableSeq() types.Seq { return e.seq.DurableSeq() }
 
