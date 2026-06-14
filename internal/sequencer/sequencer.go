@@ -40,29 +40,24 @@ type Router interface {
 // Sequencer fans in producer command rings, drains market fill rings, assigns
 // order, journals, and routes.
 type Sequencer struct {
-	reinject *spsc.RingCommand   // priority input for stop activations (U8)
-	inputs   []*spsc.RingCommand // external producers (round-robin)
-	fills    []*spsc.RingFill    // per-market fill rings
-	journal  Journal
-	router   Router
-	clock    ClockFunc
+	reinject   *spsc.RingCommand   // priority input for stop activations (U8)
+	inputs     []*spsc.RingCommand // external producers (round-robin)
+	fills      []*spsc.RingFill    // per-market fill rings
+	journaller Journaller          // WAL Append + fsync + durable watermark
+	router     Router
+	clock      ClockFunc
 
 	seq types.Seq
 	rr  int // round-robin cursor over inputs
 
-	// payloadBuf is a reusable command-encode buffer so journaling a command
-	// allocates nothing on the hot path. Aliased into the WAL Record's Payload;
-	// safe because Journal.Append must not retain it past the call.
-	payloadBuf [types.CommandSize]byte
-
 	// Durable-ack barrier (output-side only — never journaled, never affects Seq,
-	// timestamps, or fill order, so replay is byte-identical regardless of cadence):
-	//   durableSeq is the highest Seq whose WAL bytes have been fsynced.
+	// timestamps, or fill order, so replay is byte-identical regardless of cadence).
+	// The watermark itself lives on the Journaller (DurableSeq); the sequencer owns
+	// only the flush-trigger policy:
 	//   unsynced counts records appended since the last flush.
 	//   flushCap is the group-commit batch ceiling (see defaultFlushCap).
-	durableSeq types.Seq
-	unsynced   int
-	flushCap   int
+	unsynced int
+	flushCap int
 
 	// fatal latches a terminal WAL-durability failure. Once set, Step is a no-op
 	// and Run exits: the WAL is the source of truth, so the engine must not
@@ -82,9 +77,15 @@ type Config struct {
 	Reinject *spsc.RingCommand
 	Inputs   []*spsc.RingCommand
 	Fills    []*spsc.RingFill
-	Journal  Journal
-	Router   Router
-	Clock    ClockFunc
+	// Journal is the raw WAL sink. When Journaller is nil it is wrapped in a
+	// SyncJournaller (inline journaling — the default).
+	Journal Journal
+	// Journaller, when set, overrides the default SyncJournaller — e.g. an
+	// AsyncJournaller that fsyncs off the sequencer goroutine. Takes precedence
+	// over Journal.
+	Journaller Journaller
+	Router     Router
+	Clock      ClockFunc
 	// FlushCap overrides the group-commit batch ceiling (0 -> defaultFlushCap).
 	FlushCap int
 }
@@ -95,14 +96,18 @@ func New(cfg Config) *Sequencer {
 	if cap <= 0 {
 		cap = defaultFlushCap
 	}
+	j := cfg.Journaller
+	if j == nil {
+		j = NewSyncJournaller(cfg.Journal)
+	}
 	return &Sequencer{
-		reinject: cfg.Reinject,
-		inputs:   cfg.Inputs,
-		fills:    cfg.Fills,
-		journal:  cfg.Journal,
-		router:   cfg.Router,
-		clock:    cfg.Clock,
-		flushCap: cap,
+		reinject:   cfg.Reinject,
+		inputs:     cfg.Inputs,
+		fills:      cfg.Fills,
+		journaller: j,
+		router:     cfg.Router,
+		clock:      cfg.Clock,
+		flushCap:   cap,
 	}
 }
 
@@ -111,7 +116,7 @@ func (s *Sequencer) Seq() types.Seq { return s.seq }
 
 // DurableSeq returns the highest Seq whose WAL bytes have been fsynced. Output
 // (acks) at or below this watermark is safe to release; above it is speculative.
-func (s *Sequencer) DurableSeq() types.Seq { return s.durableSeq }
+func (s *Sequencer) DurableSeq() types.Seq { return s.journaller.DurableSeq() }
 
 // setFlushCap overrides the group-commit batch ceiling. Test-only seam (used to
 // prove the WAL byte stream and Seq assignment are invariant to flush cadence).
@@ -189,26 +194,13 @@ func (s *Sequencer) Step() bool {
 	return did
 }
 
-// flush forces WAL durability and advances the watermark. It captures the
-// last-appended Seq before Sync so the watermark never over-claims coverage the
-// fsync did not include. journalSync reports success for the no-op in-memory
-// journal, which still advances the watermark (nothing to fsync).
+// flush forces WAL durability (via the Journaller) and resets the unsynced
+// counter. The Journaller advances its own DurableSeq watermark.
 func (s *Sequencer) flush() error {
-	last := s.seq
-	if err := s.journalSync(); err != nil {
+	if err := s.journaller.Flush(); err != nil {
 		return err
 	}
-	s.durableSeq = last
 	s.unsynced = 0
-	return nil
-}
-
-// journalSync fsyncs the journal when it supports it; the no-op in-memory
-// journal (tests, replay) exposes no Sync method and reports success.
-func (s *Sequencer) journalSync() error {
-	if sj, ok := s.journal.(interface{ Sync() error }); ok {
-		return sj.Sync()
-	}
 	return nil
 }
 
@@ -275,13 +267,7 @@ func (s *Sequencer) sequenceAndRoute(c *types.Command) error {
 	s.seq++
 	c.Seq = s.seq
 	c.TsNanos = s.clock() // wall-clock read happens only here
-	n := types.EncodeCommandInto(s.payloadBuf[:], *c)
-	if err := s.journal.Append(wal.Record{
-		Seq:     uint64(s.seq),
-		TsNanos: c.TsNanos,
-		Type:    uint16(c.Type),
-		Payload: s.payloadBuf[:n],
-	}); err != nil {
+	if err := s.journaller.Append(*c); err != nil {
 		return err
 	}
 	s.router.OnCommand(*c)
