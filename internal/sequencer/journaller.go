@@ -15,13 +15,26 @@ import (
 // which one it drives.
 type Journaller interface {
 	// Append journals one already-sequenced command (encode + durable write). It
-	// must not retain the command past the call.
+	// must not retain the command past the call. On the async journaller this is
+	// a non-blocking hand-off that backpressures (spins) when the ring is full.
 	Append(c types.Command) error
 	// Flush forces durability and advances DurableSeq to cover every command
-	// appended so far. On the synchronous journaller this fsyncs inline.
+	// appended so far. On the synchronous journaller this fsyncs inline; on the
+	// async journaller it is a no-op hint (the consumer goroutine self-flushes).
 	Flush() error
+	// Drain blocks until every command appended so far is durable (DurableSeq has
+	// caught up to the last appended Seq), or a fatal latches.
+	Drain() error
 	// DurableSeq is the highest Seq whose bytes are durable (fsynced).
 	DurableSeq() types.Seq
+	// Fatal returns a latched terminal I/O error, or nil. The async journaller
+	// surfaces an Append/Sync failure that happened on its own goroutine here; the
+	// sync journaller always returns nil (its errors return directly from Append/
+	// Flush).
+	Fatal() error
+	// Close stops the journaller, flushing anything pending. It does not close the
+	// underlying Journal (the host owns that).
+	Close() error
 }
 
 // SyncJournaller journals inline on the caller's goroutine: Append writes to the
@@ -76,4 +89,14 @@ func (j *SyncJournaller) sync() error {
 	return nil
 }
 
+// Drain on the sync journaller is just a flush: after it, DurableSeq == lastSeq.
+func (j *SyncJournaller) Drain() error { return j.Flush() }
+
 func (j *SyncJournaller) DurableSeq() types.Seq { return j.durableSeq }
+
+// Fatal is always nil for the sync journaller — its I/O errors return directly
+// from Append/Flush on the caller's goroutine.
+func (j *SyncJournaller) Fatal() error { return nil }
+
+// Close is a no-op: the host owns closing the underlying Journal.
+func (j *SyncJournaller) Close() error { return nil }
