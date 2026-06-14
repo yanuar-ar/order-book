@@ -30,9 +30,10 @@ type ParallelEngine struct {
 	ingress *spsc.RingCommand
 	impls   map[types.MarketID]*Shard
 
-	workers []*worker
-	stop    atomic.Bool
-	wg      sync.WaitGroup
+	workers    []*worker
+	journaller sequencer.Journaller // async journaller handle (nil for sync); Close stops it
+	stop       atomic.Bool
+	wg         sync.WaitGroup
 }
 
 // matching request kinds dispatched to a worker.
@@ -205,13 +206,15 @@ func NewParallelEngine(cfg Config, groups [][]types.MarketID) *ParallelEngine {
 	}
 
 	pe.core = &Core{shards: coreShards, ledger: ledger, open: make(map[types.OrderID]openOrder, 1024), filters: cfg.Filters, qtyScale: cfg.QtyScale}
+	pe.journaller = buildJournaller(cfg)
 	pe.seq = sequencer.New(sequencer.Config{
-		Reinject: reinject,
-		Inputs:   []*spsc.RingCommand{ingress},
-		Journal:  cfg.Journal,
-		Router:   pe.core,
-		Clock:    cfg.Clock,
-		FlushCap: cfg.FlushCap,
+		Reinject:   reinject,
+		Inputs:     []*spsc.RingCommand{ingress},
+		Journal:    cfg.Journal,
+		Journaller: pe.journaller,
+		Router:     pe.core,
+		Clock:      cfg.Clock,
+		FlushCap:   cfg.FlushCap,
 	})
 
 	for i, w := range pe.workers {
@@ -269,9 +272,13 @@ func (pe *ParallelEngine) MarketIDs() []types.MarketID {
 	return ids
 }
 
-// Close stops the worker goroutines and waits for them to exit. After Close,
-// books may be read directly without racing.
+// Close stops the worker goroutines and the async journaller (if any), waiting
+// for them to exit. After Close, books may be read directly without racing, and
+// the host may close the underlying Journal.
 func (pe *ParallelEngine) Close() {
 	pe.stop.Store(true)
 	pe.wg.Wait()
+	if pe.journaller != nil {
+		_ = pe.journaller.Close()
+	}
 }

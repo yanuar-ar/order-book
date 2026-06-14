@@ -212,8 +212,11 @@ type Engine struct {
 	core    *Core
 	ingress *spsc.RingCommand
 	impls   map[types.MarketID]*Shard // concrete shards for book access
-	journal sequencer.Journal         // retained so snapshots can force durability
-	cfg     Config                    // retained for the snapshot header (scales, markets)
+	// journaller is the async journaller goroutine handle (nil for the sync
+	// journaller); Close stops it. Durability is forced through the sequencer
+	// (SyncJournal), not this handle.
+	journaller sequencer.Journaller
+	cfg        Config // retained for the snapshot header (scales, markets)
 }
 
 // Config wires an engine.
@@ -231,6 +234,18 @@ type Config struct {
 	// FlushCap overrides the group-commit batch ceiling (0 -> sequencer default).
 	// On the durable path it sets how many commands amortize one fsync.
 	FlushCap int
+	// AsyncJournal moves WAL Append + fsync onto a dedicated journaller goroutine
+	// (the LMAX "Journaller") so durability never stalls the matcher. Off by
+	// default; the synchronous inline journaller is used when false.
+	AsyncJournal bool
+	// JournalRing is the async journal ring capacity (power of two; 0 -> default).
+	JournalRing uint64
+	// JournalBatchCap is the async group-commit ceiling (0 -> default). On the
+	// durable path it amortizes the fsync over this many commands.
+	JournalBatchCap int
+	// JournalCore pins the async journaller goroutine to a core; <= 0 disables
+	// pinning (the default, and always a no-op on non-Linux).
+	JournalCore int
 	// SuppressStops installs a no-op activation sink. Set during replay, where
 	// stop activations are read from the WAL rather than regenerated.
 	SuppressStops bool
@@ -276,13 +291,15 @@ func NewEngine(cfg Config) *Engine {
 
 	ingress := spsc.NewCommand(cfg.RingSize)
 	reinject := spsc.NewCommand(cfg.RingSize)
+	journaller := buildJournaller(cfg)
 	seq := sequencer.New(sequencer.Config{
-		Reinject: reinject,
-		Inputs:   []*spsc.RingCommand{ingress},
-		Journal:  cfg.Journal,
-		Router:   core,
-		Clock:    cfg.Clock,
-		FlushCap: cfg.FlushCap,
+		Reinject:   reinject,
+		Inputs:     []*spsc.RingCommand{ingress},
+		Journal:    cfg.Journal,
+		Journaller: journaller, // nil -> sequencer wraps Journal in a SyncJournaller
+		Router:     core,
+		Clock:      cfg.Clock,
+		FlushCap:   cfg.FlushCap,
 	})
 	var sink matching.Sink = reinjectSink{seq: seq}
 	if cfg.SuppressStops {
@@ -291,7 +308,31 @@ func NewEngine(cfg Config) *Engine {
 	for _, s := range impls {
 		s.SetSink(sink)
 	}
-	return &Engine{seq: seq, core: core, ingress: ingress, impls: impls, journal: cfg.Journal, cfg: cfg}
+	return &Engine{seq: seq, core: core, ingress: ingress, impls: impls, journaller: journaller, cfg: cfg}
+}
+
+// buildJournaller returns an AsyncJournaller when cfg.AsyncJournal is set, else
+// nil (the sequencer then defaults to inline SyncJournaller). Shared by the
+// serial and parallel assemblies so both topologies journal identically.
+func buildJournaller(cfg Config) sequencer.Journaller {
+	if !cfg.AsyncJournal {
+		return nil
+	}
+	core := cfg.JournalCore
+	if core <= 0 {
+		core = -1 // no pin
+	}
+	return sequencer.NewAsyncJournaller(cfg.Journal, cfg.JournalRing, cfg.JournalBatchCap, core)
+}
+
+// Close stops the async journaller goroutine (flushing anything pending) and
+// must be called before the host closes the underlying Journal. A no-op for the
+// sync journaller. Idempotent only once — call exactly once at shutdown.
+func (e *Engine) Close() error {
+	if e.journaller != nil {
+		return e.journaller.Close()
+	}
+	return nil
 }
 
 // balanceConfig derives the ledger config from the engine config.
