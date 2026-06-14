@@ -81,3 +81,10 @@ build-equivalence), `gen_test.go` (generator determinism + order mix). Cover
 (unknown topology rejected, malformed `-cores` skipped), **edge** (empty input,
 single sample, overflow bucket, boundary percentiles). `main` wiring itself is
 exercised via `tests/integration`.
+
+`gen_bench_test.go` (`BenchmarkMeasurePathPerCommand`) locks the loadtest
+measuring loop's **harness-side** per-command work (live-mid generation + latency
+recording) at **0 allocs/op** — so the latency histogram reflects the engine, not
+harness churn. (Diagnosis note: loadtest jitter is dominated by deferred items —
+OS scheduling on non-pinned platforms, and the engine's unbounded ack buffer at
+high load — not the harness; see `docs/brainstorms/2026-06-14-loadtest-jitter-requirements.md`.)
