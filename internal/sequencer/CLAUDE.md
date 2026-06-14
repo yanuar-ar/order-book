@@ -23,6 +23,22 @@ onward; it also drains market fills and applies settlement in deterministic
   `durableSeq`, and `Append` backpressures (spins, never drops) when the ring is
   full. An Append/Sync error latches a fatal the sequencer observes via
   `Fatal()`. Selected by `market.Config.AsyncJournal`.
+- `replicator.go` — the `Replicator` seam (Replicate / Flush / Drain /
+  ReplicatedSeq / Fatal / Close), the structural mirror of `Journaller` for the
+  hot-standby stream; `NopReplicator`, the default for replication `off`
+  (`ReplicatedSeq` is `+inf`, so the ack gate stays `durableSeq`-only); and the
+  `StandbyLink` transport seam (Send / AckedSeq / Fetch / Fatal / Close). The
+  sequencer stamps a leadership-term `Epoch` on every command (bumped on
+  promotion), calls `Replicate` after the durable `Append` in `sequenceAndRoute`,
+  gates output on `ReleaseSeq() = min(durableSeq, replicatedSeq)`, and halts on a
+  replicator fatal.
+- `async_replicator.go` — `AsyncReplicator`: streams to the standby off the
+  sequencer goroutine via a `StandbyLink`, publishing `replicatedSeq` from the
+  link's `AckedSeq`. The one deliberate divergence from `AsyncJournaller`:
+  `Replicate` is **non-blocking** — a full ring drops the command (still durable
+  in the WAL) and the consumer backfills it via `StandbyLink.Fetch`, so a
+  slow/dead standby stalls acks only, never journaling or matching. Selected by
+  `market.Config.ReplicationMode` (`buildReplicator`).
 
 ## Durable-ack barrier
 

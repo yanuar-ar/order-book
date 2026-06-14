@@ -1,9 +1,18 @@
 package market
 
 import (
+	"errors"
+
 	"github.com/yanuar-ar/order-book/internal/types"
 	"github.com/yanuar-ar/order-book/internal/wal"
 )
+
+// ErrStaleEpoch is returned when replay encounters a command whose leadership
+// term is below the highest term seen so far in the log — a record from a fenced
+// (zombie) old primary spliced into the stream. A node's own log is always
+// epoch-monotonic, so a backwards step means the log is not a valid single
+// lineage. Recovery halts rather than applying it.
+var ErrStaleEpoch = errors.New("market: stale epoch in log (fenced record)")
 
 // Recover rebuilds an engine on startup. It loads the latest snapshot in snapDir
 // and replays the WAL tail from walDir; if the snapshot is missing, corrupt
@@ -39,11 +48,16 @@ func Recover(cfg Config, walDir, snapDir string, logf func(string, ...any)) (*En
 	}
 
 	maxSeq := afterSeq
+	maxEpoch := e.Epoch() // primed from the snapshot (0 on a full replay)
 	err := wal.Replay(walDir, afterSeq, func(rec wal.Record) error {
 		cmd, derr := types.DecodeCommand(rec.Payload)
 		if derr != nil {
 			return derr
 		}
+		if cmd.Epoch < maxEpoch {
+			return ErrStaleEpoch // fenced: a backwards term step is a spliced zombie record
+		}
+		maxEpoch = cmd.Epoch
 		e.ApplyJournaled(cmd)
 		maxSeq = rec.Seq
 		return nil
@@ -53,6 +67,7 @@ func Recover(cfg Config, walDir, snapDir string, logf func(string, ...any)) (*En
 	}
 
 	e.SetSeq(types.Seq(maxSeq))
+	e.SetEpoch(maxEpoch)
 	e.EnableStops()
 	return e, nil
 }

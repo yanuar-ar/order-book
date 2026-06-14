@@ -9,7 +9,14 @@ directly to the WAL and copy through SPSC rings without allocation.
 - `types.go` — scalar IDs (`Price`, `Qty`, `AccountID`, `OrderID`, `MarketID`,
   `Seq`, …) and the wire structs: `Command` (external, journaled), `Fill`,
   `FundedOrder` (post-reservation envelope). Enums: `Side`, `OrderType`, `TIF`,
-  `Flags`, `CmdType`.
+  `Flags`, `CmdType` (incl. `CmdDegradeToSolo`/`CmdRearm`, the replication control
+  records that flip the ack-gate mode and are no-ops to state). `Command.Epoch`
+  is the leadership term the sequencer
+  stamps (envelope metadata like `Seq`/`TsNanos`): matching never reads it, so it
+  does not affect state or the fingerprint — it rides the command (not just the
+  WAL record) so it reaches the async journaller/replicator consumers through the
+  SPSC ring, and replay/the live path fence on it (a backwards term is a fenced
+  zombie record). `CommandSize` is `110` (the epoch added 8 bytes).
 - `money.go` — integer fixed-point arithmetic: `MulDiv` (128-bit intermediate
   via `math/bits`), `Notional`, `Fee`. The `ok` return is an overflow signal —
   callers MUST reject the operation when `ok == false`, never wrap.

@@ -32,6 +32,8 @@ type ParallelEngine struct {
 
 	workers    []*worker
 	journaller sequencer.Journaller // async journaller handle (nil for sync); Close stops it
+	replicator sequencer.Replicator // hot-standby replicator (nil for off); Close stops it
+	standby    *Standby             // shadow engine the replicator drives (nil for off)
 	stop       atomic.Bool
 	wg         sync.WaitGroup
 }
@@ -205,13 +207,15 @@ func NewParallelEngine(cfg Config, groups [][]types.MarketID) *ParallelEngine {
 		pe.workers = append(pe.workers, &worker{reqs: reqs, resps: resps, shards: wshards, coll: coll, stop: &pe.stop})
 	}
 
-	pe.core = &Core{shards: coreShards, ledger: ledger, open: make(map[types.OrderID]openOrder, 1024), filters: cfg.Filters, qtyScale: cfg.QtyScale}
+	pe.core = &Core{shards: coreShards, ledger: ledger, open: make(map[types.OrderID]openOrder, 1024), filters: cfg.Filters, qtyScale: cfg.QtyScale, syncRep: cfg.ReplicationMode == "sync"}
 	pe.journaller = buildJournaller(cfg)
+	pe.replicator, pe.standby = buildReplicator(cfg)
 	pe.seq = sequencer.New(sequencer.Config{
 		Reinject:   reinject,
 		Inputs:     []*spsc.RingCommand{ingress},
 		Journal:    cfg.Journal,
 		Journaller: pe.journaller,
+		Replicator: pe.replicator,
 		Router:     pe.core,
 		Clock:      cfg.Clock,
 		FlushCap:   cfg.FlushCap,
@@ -242,6 +246,10 @@ func (pe *ParallelEngine) Drain() {
 	_ = pe.seq.DrainJournal()
 }
 
+// DrainStandby blocks until the hot standby has caught up (no-op when off). See
+// Engine.DrainStandby.
+func (pe *ParallelEngine) DrainStandby() error { return pe.seq.DrainReplication() }
+
 // Ledger exposes the balance ledger (read after Drain/Close for consistency).
 func (pe *ParallelEngine) Ledger() *balance.Ledger { return pe.core.ledger }
 
@@ -252,10 +260,11 @@ func (pe *ParallelEngine) Shard(m types.MarketID) *Shard { return pe.impls[m] }
 // Filters returns the per-market order filters (read access for invariants).
 func (pe *ParallelEngine) Filters() map[types.MarketID]types.MarketFilters { return pe.core.filters }
 
-// Acks returns the durable acks (Seq <= durableSeq). The watermark lives on the
-// shared sequencer, so serial and parallel engines gate identically.
+// Acks returns the releasable acks (Seq <= min(durableSeq, replicatedSeq)). The
+// watermark lives on the shared sequencer, so serial and parallel engines gate
+// identically — including the replication gate.
 func (pe *ParallelEngine) Acks() []types.Ack {
-	return releasedAcks(pe.core.acks, pe.seq.DurableSeq())
+	return releasedAcks(pe.core.acks, releaseGate(pe.seq, pe.core))
 }
 
 // AcksAll returns every ack appended so far, ungated by durability (see
@@ -264,6 +273,9 @@ func (pe *ParallelEngine) AcksAll() []types.Ack { return pe.core.acks }
 
 // DurableSeq returns the highest Seq whose WAL bytes have been fsynced.
 func (pe *ParallelEngine) DurableSeq() types.Seq { return pe.seq.DurableSeq() }
+
+// ReleasedSeq returns the releasable-ack watermark (see Engine.ReleasedSeq).
+func (pe *ParallelEngine) ReleasedSeq() types.Seq { return releaseGate(pe.seq, pe.core) }
 
 // Seq returns the last assigned sequence number.
 func (pe *ParallelEngine) Seq() types.Seq { return pe.seq.Seq() }
@@ -290,4 +302,10 @@ func (pe *ParallelEngine) Close() {
 	if pe.journaller != nil {
 		_ = pe.journaller.Close()
 	}
+	if pe.replicator != nil {
+		_ = pe.replicator.Close()
+	}
 }
+
+// Standby returns the hot-standby shadow engine (nil when replication is off).
+func (pe *ParallelEngine) Standby() *Standby { return pe.standby }

@@ -92,6 +92,43 @@ func TestLoadRejectsBadJournalMode(t *testing.T) {
 	}
 }
 
+func TestLoadReplicationDefaultsOff(t *testing.T) {
+	c, err := Load(envMap(map[string]string{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.ReplicationMode != "off" {
+		t.Fatalf("default ReplicationMode = %q, want \"off\"", c.ReplicationMode)
+	}
+	if c.ReplicationRing != 0 {
+		t.Fatalf("default ReplicationRing = %d, want 0", c.ReplicationRing)
+	}
+}
+
+func TestLoadReplicationOverride(t *testing.T) {
+	for _, mode := range []string{"sync", "async"} {
+		c, err := Load(envMap(map[string]string{"OB_REPLICATION_MODE": mode, "OB_REPLICATION_RING": "65536"}))
+		if err != nil {
+			t.Fatalf("mode %q: %v", mode, err)
+		}
+		if c.ReplicationMode != mode || c.ReplicationRing != 65536 {
+			t.Fatalf("got mode=%q ring=%d, want %s/65536", c.ReplicationMode, c.ReplicationRing, mode)
+		}
+	}
+}
+
+func TestLoadRejectsBadReplicationMode(t *testing.T) {
+	if _, err := Load(envMap(map[string]string{"OB_REPLICATION_MODE": "maybe"})); err == nil {
+		t.Fatal("expected error for invalid OB_REPLICATION_MODE, got nil")
+	}
+}
+
+func TestLoadRejectsNonPowerOfTwoReplicationRing(t *testing.T) {
+	if _, err := Load(envMap(map[string]string{"OB_REPLICATION_MODE": "sync", "OB_REPLICATION_RING": "1000"})); err == nil {
+		t.Fatal("expected error for non-power-of-two OB_REPLICATION_RING, got nil")
+	}
+}
+
 func TestLoadRejectsNonPowerOfTwoJournalRing(t *testing.T) {
 	if _, err := Load(envMap(map[string]string{"OB_JOURNAL_MODE": "async", "OB_JOURNAL_RING": "1000"})); err == nil {
 		t.Fatal("expected error for non-power-of-two OB_JOURNAL_RING, got nil")

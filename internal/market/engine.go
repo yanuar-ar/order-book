@@ -42,6 +42,17 @@ type Core struct {
 	acks     []types.Ack // captured for tests/publisher
 	filters  map[types.MarketID]types.MarketFilters
 	qtyScale int64
+	// degraded is the replication ack-gate mode: when true, acks gate on
+	// durability alone (the standby requirement is dropped). It is flipped by the
+	// CmdDegradeToSolo / CmdRearm control records, so it is reconstructed
+	// deterministically on replay; it is output-side only and is NOT part of the
+	// state fingerprint.
+	degraded bool
+	// syncRep is true only in "sync" replication mode, where acks must wait for the
+	// standby (gate on min(durableSeq, replicatedSeq)). In "async" (and "off") mode
+	// the replicator still streams but acks release on durability alone — replication
+	// is off the critical path with bounded lag. Set once at construction.
+	syncRep bool
 }
 
 // OnSettlement is unused in single-threaded mode (fills settle inline in
@@ -67,6 +78,12 @@ func (c *Core) OnCommand(cmd types.Command) {
 		c.amend(cmd)
 	case types.CmdNewOrder:
 		c.newOrder(cmd)
+	case types.CmdDegradeToSolo:
+		c.degraded = true // drop the replication requirement (output-side only)
+		c.ack(cmd, types.AckAccepted, types.ReasonNone)
+	case types.CmdRearm:
+		c.degraded = false // restore sync gating
+		c.ack(cmd, types.AckAccepted, types.ReasonNone)
 	}
 }
 
@@ -216,6 +233,11 @@ type Engine struct {
 	// journaller); Close stops it. Durability is forced through the sequencer
 	// (SyncJournal), not this handle.
 	journaller sequencer.Journaller
+	// replicator streams to the hot standby (nil when replication is off); Close
+	// stops it. standby is the shadow engine it drives (nil when off), exposed for
+	// fingerprint/invariant comparison and promotion.
+	replicator sequencer.Replicator
+	standby    *Standby
 	cfg        Config // retained for the snapshot header (scales, markets)
 }
 
@@ -246,6 +268,20 @@ type Config struct {
 	// JournalCore pins the async journaller goroutine to a core; <= 0 disables
 	// pinning (the default, and always a no-op on non-Linux).
 	JournalCore int
+	// ReplicationMode selects the hot-standby replicator: "off" (the default, no
+	// standby), "sync" (acks gate on the standby's replicated watermark), or
+	// "async" (stream off the critical path, bounded lag). Wired by buildReplicator
+	// (U5); the ack gate consumes the watermark in U3.
+	ReplicationMode string
+	// ReplicationRing is the replicator hand-off ring capacity (power of two; 0 ->
+	// default). ReplicationCore pins the replicator consumer goroutine (<= 0
+	// disables, the default).
+	ReplicationRing uint64
+	ReplicationCore int
+	// WALDir is the primary's WAL directory, used by the in-process replicator
+	// link to backfill overflow gaps (records the live ring dropped under
+	// backpressure are re-read from the WAL). Optional; empty disables backfill.
+	WALDir string
 	// SuppressStops installs a no-op activation sink. Set during replay, where
 	// stop activations are read from the WAL rather than regenerated.
 	SuppressStops bool
@@ -287,16 +323,18 @@ func NewEngine(cfg Config) *Engine {
 		impls[m] = s
 		shards[m] = s
 	}
-	core := &Core{shards: shards, ledger: ledger, open: make(map[types.OrderID]openOrder, 1024), filters: cfg.Filters, qtyScale: cfg.QtyScale}
+	core := &Core{shards: shards, ledger: ledger, open: make(map[types.OrderID]openOrder, 1024), filters: cfg.Filters, qtyScale: cfg.QtyScale, syncRep: cfg.ReplicationMode == "sync"}
 
 	ingress := spsc.NewCommand(cfg.RingSize)
 	reinject := spsc.NewCommand(cfg.RingSize)
 	journaller := buildJournaller(cfg)
+	replicator, standby := buildReplicator(cfg)
 	seq := sequencer.New(sequencer.Config{
 		Reinject:   reinject,
 		Inputs:     []*spsc.RingCommand{ingress},
 		Journal:    cfg.Journal,
 		Journaller: journaller, // nil -> sequencer wraps Journal in a SyncJournaller
+		Replicator: replicator, // nil -> sequencer uses NopReplicator
 		Router:     core,
 		Clock:      cfg.Clock,
 		FlushCap:   cfg.FlushCap,
@@ -308,7 +346,7 @@ func NewEngine(cfg Config) *Engine {
 	for _, s := range impls {
 		s.SetSink(sink)
 	}
-	return &Engine{seq: seq, core: core, ingress: ingress, impls: impls, journaller: journaller, cfg: cfg}
+	return &Engine{seq: seq, core: core, ingress: ingress, impls: impls, journaller: journaller, replicator: replicator, standby: standby, cfg: cfg}
 }
 
 // buildJournaller returns an AsyncJournaller when cfg.AsyncJournal is set, else
@@ -329,11 +367,25 @@ func buildJournaller(cfg Config) sequencer.Journaller {
 // must be called before the host closes the underlying Journal. A no-op for the
 // sync journaller. Idempotent only once — call exactly once at shutdown.
 func (e *Engine) Close() error {
+	var err error
 	if e.journaller != nil {
-		return e.journaller.Close()
+		err = e.journaller.Close()
 	}
-	return nil
+	if e.replicator != nil {
+		if rerr := e.replicator.Close(); rerr != nil && err == nil {
+			err = rerr
+		}
+	}
+	return err
 }
+
+// Standby returns the hot-standby shadow engine (nil when replication is off),
+// for fingerprint/invariant comparison and promotion.
+func (e *Engine) Standby() *Standby { return e.standby }
+
+// Degraded reports whether the replication ack-gate is in solo mode (acks gate on
+// durability alone). Output-side state; reconstructed deterministically on replay.
+func (e *Engine) Degraded() bool { return e.core.degraded }
 
 // balanceConfig derives the ledger config from the engine config.
 func balanceConfig(cfg Config) balance.Config {
@@ -371,6 +423,13 @@ func (e *Engine) Drain() {
 	_ = e.seq.DrainJournal()
 }
 
+// DrainStandby blocks until the hot standby has durably applied every replicated
+// command so far (a no-op when replication is off). It is the graceful standby
+// catch-up — distinct from Drain (primary durability) and Close (abrupt stop that
+// abandons any lag). Call it after Drain at quiesce points where the standby must
+// be converged: snapshot, promotion, or a convergence assertion.
+func (e *Engine) DrainStandby() error { return e.seq.DrainReplication() }
+
 // Ledger exposes the balance ledger (read access for invariants/tests).
 func (e *Engine) Ledger() *balance.Ledger { return e.core.ledger }
 
@@ -394,7 +453,21 @@ func (e *Engine) MarketIDs() []types.MarketID {
 // Acks above durableSeq are speculative (their command is matched in-memory but
 // not yet on disk) and must not be observed until a flush makes them durable.
 // After Drain the watermark equals Seq, so every ack is released.
-func (e *Engine) Acks() []types.Ack { return releasedAcks(e.core.acks, e.seq.DurableSeq()) }
+func (e *Engine) Acks() []types.Ack { return releasedAcks(e.core.acks, releaseGate(e.seq, e.core)) }
+
+// releaseGate is the highest Seq whose ack is safe to release. It gates on
+// min(durableSeq, replicatedSeq) ONLY in sync replication mode and only while not
+// degraded — a command is then confirmed once durable AND replicated. In async
+// mode (replicator streams but off the critical path), off mode, or once a
+// degrade-to-solo is in effect, the gate is durableSeq alone. The syncRep and
+// degraded flags live on the Core (degraded replays deterministically); the
+// watermarks live on the shared sequencer, so serial and parallel gate identically.
+func releaseGate(seq *sequencer.Sequencer, core *Core) types.Seq {
+	if !core.syncRep || core.degraded {
+		return seq.DurableSeq()
+	}
+	return seq.ReleaseSeq()
+}
 
 // AcksAll returns every ack appended so far, ungated by durability — for
 // benchmark harnesses that track the durable watermark (DurableSeq) themselves
@@ -421,12 +494,30 @@ func (e *Engine) Seq() types.Seq { return e.seq.Seq() }
 // run loop checks this after each Step; the snapshotter checks it after Drain.
 func (e *Engine) Fatal() error { return e.seq.Fatal() }
 
+// ReplicatorFatal returns a latched standby-replication failure (or nil). It does
+// not halt the engine; the host should log it so an operator can intervene
+// (degrade-to-solo).
+func (e *Engine) ReplicatorFatal() error { return e.seq.ReplicatorFatal() }
+
 // DurableSeq returns the highest Seq whose WAL bytes have been fsynced.
 func (e *Engine) DurableSeq() types.Seq { return e.seq.DurableSeq() }
+
+// ReleasedSeq returns the highest Seq whose ack is releasable — the gate Acks()
+// uses. It equals DurableSeq when replication is off (or degraded), and
+// min(durableSeq, replicatedSeq) in sync mode (a command is released only once
+// durable AND replicated). Harnesses cursor on it to measure ack-release latency.
+func (e *Engine) ReleasedSeq() types.Seq { return releaseGate(e.seq, e.core) }
 
 // SetSeq primes the sequencer watermark. Used by snapshot restore (before live
 // stepping resumes) so post-restore commands continue contiguously.
 func (e *Engine) SetSeq(s types.Seq) { e.seq.SetSeq(s) }
+
+// Epoch returns the current leadership term (0 until the first promotion).
+func (e *Engine) Epoch() uint64 { return e.seq.Epoch() }
+
+// SetEpoch primes the leadership term. Used by snapshot restore (to the
+// snapshot's epoch) and promotion (incremented). Quiesced-only, like SetSeq.
+func (e *Engine) SetEpoch(epoch uint64) { e.seq.SetEpoch(epoch) }
 
 // SyncJournal forces durability of journaled records through the current Seq. A
 // snapshot must be published only after the WAL is durable through its

@@ -44,11 +44,13 @@ type Sequencer struct {
 	inputs     []*spsc.RingCommand // external producers (round-robin)
 	fills      []*spsc.RingFill    // per-market fill rings
 	journaller Journaller          // WAL Append + fsync + durable watermark
+	replicator Replicator          // hot-standby stream + replicated watermark
 	router     Router
 	clock      ClockFunc
 
-	seq types.Seq
-	rr  int // round-robin cursor over inputs
+	seq   types.Seq
+	epoch uint64 // leadership term; stamped on every command, bumped on promotion (U7)
+	rr    int    // round-robin cursor over inputs
 
 	// Durable-ack barrier (output-side only — never journaled, never affects Seq,
 	// timestamps, or fill order, so replay is byte-identical regardless of cadence).
@@ -84,6 +86,9 @@ type Config struct {
 	// AsyncJournaller that fsyncs off the sequencer goroutine. Takes precedence
 	// over Journal.
 	Journaller Journaller
+	// Replicator, when set, streams sequenced commands to a hot standby. Nil ->
+	// NopReplicator (replication off), so the ack gate stays durableSeq-only.
+	Replicator Replicator
 	Router     Router
 	Clock      ClockFunc
 	// FlushCap overrides the group-commit batch ceiling (0 -> defaultFlushCap).
@@ -100,11 +105,16 @@ func New(cfg Config) *Sequencer {
 	if j == nil {
 		j = NewSyncJournaller(cfg.Journal)
 	}
+	r := cfg.Replicator
+	if r == nil {
+		r = NopReplicator{}
+	}
 	return &Sequencer{
 		reinject:   cfg.Reinject,
 		inputs:     cfg.Inputs,
 		fills:      cfg.Fills,
 		journaller: j,
+		replicator: r,
 		router:     cfg.Router,
 		clock:      cfg.Clock,
 		flushCap:   cap,
@@ -117,6 +127,34 @@ func (s *Sequencer) Seq() types.Seq { return s.seq }
 // DurableSeq returns the highest Seq whose WAL bytes have been fsynced. Output
 // (acks) at or below this watermark is safe to release; above it is speculative.
 func (s *Sequencer) DurableSeq() types.Seq { return s.journaller.DurableSeq() }
+
+// ReplicatedSeq returns the highest Seq the standby has durably applied (the
+// maximum sentinel when replication is off).
+func (s *Sequencer) ReplicatedSeq() types.Seq { return s.replicator.ReplicatedSeq() }
+
+// ReleaseSeq is the highest Seq whose ack is safe to release: a command is
+// confirmed only once it is both locally durable AND replicated, so the gate is
+// min(durableSeq, replicatedSeq). With replication off the replicated watermark
+// is +inf, so this collapses to durableSeq and behavior is unchanged. The
+// degrade-to-solo command (U8) raises the gate to durableSeq-only past its Seq.
+func (s *Sequencer) ReleaseSeq() types.Seq {
+	d := s.journaller.DurableSeq()
+	r := s.replicator.ReplicatedSeq()
+	if r < d {
+		return r
+	}
+	return d
+}
+
+// DrainReplication blocks until the standby has durably applied every replicated
+// command so far (or a fatal latches). Quiesce points use it alongside
+// DrainJournal so a snapshot never captures state the standby has not backed.
+func (s *Sequencer) DrainReplication() error {
+	if s.fatal != nil {
+		return s.fatal
+	}
+	return s.replicator.Drain()
+}
 
 // DrainJournal blocks until the journaller has made every appended command
 // durable (DurableSeq catches up to the last appended Seq). For the async
@@ -149,6 +187,13 @@ func (s *Sequencer) setFlushCap(n int) {
 // snapshot's Seq. It must only be called while the engine is quiesced (before
 // live stepping resumes); it does not journal or route anything.
 func (s *Sequencer) SetSeq(seq types.Seq) { s.seq = seq }
+
+// Epoch returns the current leadership term stamped on outgoing commands.
+func (s *Sequencer) Epoch() uint64 { return s.epoch }
+
+// SetEpoch primes the leadership term. Like SetSeq it must only be called while
+// quiesced — at restore (to the snapshot's epoch) or at promotion (incremented).
+func (s *Sequencer) SetEpoch(epoch uint64) { s.epoch = epoch }
 
 // Inject enqueues a synthetic command (a stop activation) for sequencing. It is
 // called by market shards; returns false if the re-injection ring is full.
@@ -206,6 +251,12 @@ func (s *Sequencer) Step() bool {
 		s.fatal = err
 		return did
 	}
+	// A replicator fatal must NOT halt the engine: the replicator is not the
+	// source of truth (the WAL is), and halting would kill the degrade-to-solo
+	// rescue path in sync mode and take the primary down over a non-critical
+	// backup in async mode. Its death freezes replicatedSeq, which stalls
+	// sync-mode acks via the gate (recoverable by an operator degrade-to-solo);
+	// async/off are unaffected. It is observable via ReplicatorFatal().
 	if s.unsynced > 0 && s.unsynced >= s.flushCap {
 		// Batch ceiling reached under load: amortize the fsync (the LMAX
 		// batching effect). flush() zeroes unsynced, so this fires at most once.
@@ -231,6 +282,12 @@ func (s *Sequencer) flush() error {
 // Fatal returns the latched terminal WAL-durability failure, or nil. The host
 // run loop checks this after each Step and halts on a non-nil result.
 func (s *Sequencer) Fatal() error { return s.fatal }
+
+// ReplicatorFatal returns a latched replication failure (a dead standby link), or
+// nil. Unlike Fatal it does NOT stop the engine — it is an operator signal: in
+// sync mode the ack gate is already stalling on the frozen replicatedSeq, and the
+// fix is an operator degrade-to-solo, which requires the engine to keep running.
+func (s *Sequencer) ReplicatorFatal() error { return s.replicator.Fatal() }
 
 // Run loops Step until stop is closed or a fatal latches (busy-spin). Used by
 // the assembled engine.
@@ -290,8 +347,15 @@ func (s *Sequencer) pollExternal() (types.Command, bool) {
 func (s *Sequencer) sequenceAndRoute(c *types.Command) error {
 	s.seq++
 	c.Seq = s.seq
+	c.Epoch = s.epoch     // leadership term, bumped once per promotion (U7)
 	c.TsNanos = s.clock() // wall-clock read happens only here
 	if err := s.journaller.Append(*c); err != nil {
+		return err
+	}
+	// Replicate after the durable append so the standby never gets ahead of the
+	// primary's WAL. Replicate is non-blocking (a slow standby stalls acks, not
+	// matching); a transport failure latches the same fail-stop as a journal error.
+	if err := s.replicator.Replicate(*c); err != nil {
 		return err
 	}
 	s.router.OnCommand(*c)

@@ -56,6 +56,52 @@ func RunDifferentialAsync(stream Stream) error {
 	return runDifferential(e, stream)
 }
 
+// RunDifferentialReplicated runs the differential check with a hot standby wired
+// in (sync replication over async journaling, the production posture). On top of
+// the oracle and CheckAllInvariants, it asserts the INV-REP-* properties after
+// every command: the standby converges to the primary's fingerprint at the shared
+// Seq with no gaps. Proves replication is behavior-transparent.
+func RunDifferentialReplicated(stream Stream) error {
+	cfg := engineCfg()
+	cfg.AsyncJournal = true
+	cfg.JournalCore = -1
+	cfg.ReplicationMode = "sync"
+	cfg.ReplicationCore = -1
+	e := market.NewEngine(cfg)
+	defer e.Close()
+	return runDifferentialReplicated(e, stream)
+}
+
+// runDifferentialReplicated mirrors runDifferential but also checks
+// CheckReplicationInvariants each step (applyNet drains, so the standby has
+// caught up at every check point).
+func runDifferentialReplicated(e *market.Engine, stream Stream) error {
+	mod := refmodel.New(modelCfg())
+	net := map[types.AssetID]int64{}
+
+	for _, c := range stream.Deposits {
+		applyNet(net, e, c)
+		mod.Apply(c)
+	}
+	for i, c := range stream.Orders {
+		c.Seq = types.Seq(i + 1)
+		applyNet(net, e, c)
+		mod.Apply(c)
+		_ = e.DrainStandby() // converge the standby before the per-step INV-REP check
+
+		if engineState(e).Canonical() != mod.Snapshot().Canonical() {
+			return fmt.Errorf("state diverged at order step %d (cmd %+v)", i, c)
+		}
+		if err := CheckAllInvariants(e, net); err != nil {
+			return fmt.Errorf("invariant violated at order step %d (cmd %+v): %w", i, c, err)
+		}
+		if err := CheckReplicationInvariants(e); err != nil {
+			return fmt.Errorf("replication invariant violated at order step %d (cmd %+v): %w", i, c, err)
+		}
+	}
+	return nil
+}
+
 // RunDifferentialParallel runs the same check against the ParallelEngine with
 // the given worker grouping, proving the parallel topology matches the oracle
 // (and therefore the serial engine) across every order type.

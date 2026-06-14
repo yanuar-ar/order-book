@@ -75,6 +75,18 @@ money-safety guarantee is enforced — read
   on-grid after each command (`invariants_filter_test.go`,
   `filter_differential_test.go`, filter-boundary fuzz seeds).
 
+- **Replication (hot standby)** — `RunDifferentialReplicated`
+  (`replication_test.go`) runs a sync standby over async journaling through the
+  broad + sharp generators, asserting `INV-REP-01` (standby fingerprint == primary
+  at the shared Seq) and `INV-REP-02` (gap-free prefix) after every command
+  (`invariants_replication.go`). `chaos_test.go` covers primary-crash promotion
+  (every confirmed order preserved: `confirmed ⊆ min(durableSeq, replicatedSeq)`;
+  promoted state identical + invariant-clean) and standby convergence;
+  `FuzzReplicatedEngine` is the coverage-guided target. Zombie-epoch fencing,
+  degrade-to-solo/re-arm replay + snapshot persistence, and idempotent standby
+  apply are unit-tested in `internal/market` (`promote_test.go`,
+  `degrade_test.go`, `standby_test.go`).
+
 Out of scope (no feature in v1): ClientReqID idempotency (INV-IDM),
 amend-up/reprice priority (INV-AMD-02).
 

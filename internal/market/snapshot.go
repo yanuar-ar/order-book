@@ -12,7 +12,10 @@ import (
 
 // snapshotVersion is the snapshot format version. Bump it on any change to the
 // section layout — the format is a durability contract, like the WAL.
-const snapshotVersion uint16 = 1
+// v2: added the secReplication section (degrade gate mode) and the epoch field in
+// the wal container header; a v1 snapshot is now ErrSnapshotIncompatible (Restore
+// falls back to full WAL replay).
+const snapshotVersion uint16 = 2
 
 // Snapshot section indices within the wal container.
 const (
@@ -21,6 +24,7 @@ const (
 	secOpenMap
 	secBooks
 	secStops
+	secReplication // output-side replication gate mode (degraded); not in the fingerprint
 	secCount
 )
 
@@ -50,7 +54,8 @@ func (e *Engine) Snapshot(path string) error {
 	sections[secOpenMap] = encodeOpenMap(e.core.open)
 	sections[secBooks] = e.encodeBooks()
 	sections[secStops] = e.encodeStops()
-	return wal.WriteSnapshot(path, uint64(e.seq.Seq()), sections)
+	sections[secReplication] = []byte{boolByte(e.core.degraded)}
+	return wal.WriteSnapshot(path, uint64(e.seq.Seq()), e.seq.Epoch(), sections)
 }
 
 // Restore rebuilds a fresh engine from the snapshot at path using cfg (the same
@@ -60,7 +65,7 @@ func (e *Engine) Snapshot(path string) error {
 // replay does not re-trigger journaled activations; the caller re-enables them
 // via EnableStops once the tail is applied.
 func Restore(cfg Config, path string) (*Engine, error) {
-	seq, sections, err := wal.ReadSnapshot(path)
+	seq, epoch, sections, err := wal.ReadSnapshot(path)
 	if err != nil {
 		return nil, err // bad CRC / truncated → caller falls back to full replay
 	}
@@ -94,6 +99,10 @@ func Restore(cfg Config, path string) (*Engine, error) {
 	}
 
 	e.SetSeq(types.Seq(seq))
+	e.SetEpoch(epoch)
+	if rep := sections[secReplication]; len(rep) > 0 {
+		e.core.degraded = rep[0] != 0
+	}
 
 	if err := e.selfCheck(); err != nil {
 		return nil, err
@@ -123,6 +132,13 @@ func (e *Engine) StateFingerprint() []byte {
 		out = append(out, p...)
 	}
 	return out
+}
+
+func boolByte(b bool) byte {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // encodeHeader serializes the format version, the money-scale config the ledger

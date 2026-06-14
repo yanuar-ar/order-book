@@ -38,6 +38,7 @@ func main() {
 	topology := flag.String("topology", "serial", "engine topology: serial | parallel")
 	cores := flag.String("cores", "0;1,2", "parallel only: market->worker map ('0;1,2')")
 	journal := flag.String("journal", "async", "journal mode: async (off-thread fsync, default) | sync (inline fsync) | none (no WAL, match latency only)")
+	replication := flag.String("replication", "off", "replication mode: off (default) | sync (hot standby, production posture — the ack SLO becomes durable+replicated) | async")
 	flushCap := flag.Int("flushcap", 0, "group-commit batch ceiling (commands per fsync; 0 = engine default)")
 	walDir := flag.String("wal", "", "WAL directory for durable modes (default: a temp dir, removed on exit)")
 	flag.Parse()
@@ -48,8 +49,15 @@ func main() {
 		fmt.Println("invalid -journal:", *journal, "(want async | sync | none)")
 		return
 	}
+	switch *replication {
+	case "off", "sync", "async":
+	default:
+		fmt.Println("invalid -replication:", *replication, "(want off | sync | async)")
+		return
+	}
 	durable := *journal != "none"
 	async := *journal == "async"
+	replicated := *replication != "off"
 
 	var groups [][]types.MarketID
 	if *topology == "parallel" {
@@ -75,11 +83,13 @@ func main() {
 		}
 		defer w.Close() // LIFO: runs after cleanup() closes the engine/journaller
 		cfg.Journal = w
+		cfg.WALDir = dir // the in-process standby backfills overflow gaps from here
 		if async {
 			cfg.AsyncJournal = true
 			cfg.JournalBatchCap = *flushCap
 		}
 	}
+	cfg.ReplicationMode = *replication
 	eng, cleanup, err := harness.BuildEngine(*topology, groups, cfg)
 	if err != nil {
 		println(err.Error())
@@ -110,6 +120,9 @@ func main() {
 
 	title := "spot order-book load test"
 	sub := topologyLine(*topology, groups) + "  " + journalLabel(durable, async)
+	if replicated {
+		sub += "  +standby (" + *replication + ")"
+	}
 
 	interval := time.Duration(int64(time.Second) / int64(*tps))
 	start := time.Now()
@@ -138,7 +151,7 @@ func main() {
 			// the durable watermark (O(1) amortized — no O(prefix) rescan), and
 			// record each newly-durable ack from its intended time.
 			raw := eng.AcksAll()
-			d := eng.DurableSeq()
+			d := eng.ReleasedSeq() // durable when off; min(durable,replicated) in sync replication
 			nowNs := done.UnixNano()
 			for ackCursor < len(raw) && raw[ackCursor].Seq <= d {
 				lat := nowNs - raw[ackCursor].ClientTsNanos
@@ -165,7 +178,7 @@ func main() {
 
 	final := harness.BuildFrame(eng, types.MarketID(*view), *levels, h, title, sub, i, time.Since(start), backpressure)
 	harness.Render(final)
-	printSummary(final, hDur, durable, async)
+	printSummary(final, hDur, durable, async, *replication)
 }
 
 // journalLabel describes the journaling path for the TUI sub-line and summary.
@@ -196,13 +209,18 @@ func topologyLine(topology string, groups [][]types.MarketID) string {
 	return "topology parallel  " + strings.Join(parts, "  ")
 }
 
-func printSummary(f *harness.Frame, hDur *harness.Hist, durable, async bool) {
+func printSummary(f *harness.Frame, hDur *harness.Hist, durable, async bool, replication string) {
 	fmt.Printf("\n==== load test complete ====\n")
 	fmt.Printf("commands processed : %d\n", f.Count)
 	fmt.Printf("duration           : %.1fs\n", f.Elapsed.Seconds())
 	fmt.Printf("throughput         : %.0f cmd/s\n", f.TPS)
 	fmt.Printf("backpressure       : %d\n", f.BP)
 	fmt.Printf("journal            : %s\n", journalLabel(durable, async))
+	ackName := "durable-ack"
+	if replication != "off" {
+		fmt.Printf("replication        : %s (in-process hot standby — shares cores, so this is a lower bound vs a 2-node setup)\n", replication)
+		ackName = "durable+replicated-ack" // the ack SLO now spans the standby too
+	}
 	// Match latency (intended -> matched). When not durable this is the only SLO,
 	// so it keeps the original "latency ..." labels; when durable it is the
 	// internal SLO alongside durable-ack below.
@@ -217,10 +235,10 @@ func printSummary(f *harness.Frame, hDur *harness.Hist, durable, async bool) {
 	fmt.Printf("%-*s: %s\n", w, label+" p99", harness.Dur(f.P99))
 	fmt.Printf("%-*s: %s\n", w, label+" max", harness.Dur(f.Mx))
 	if durable {
-		fmt.Printf("%-*s: %s\n", w, "durable-ack average", harness.Dur(hDur.Avg()))
-		fmt.Printf("%-*s: %s\n", w, "durable-ack median(p50)", harness.Dur(hDur.Pct(50)))
-		fmt.Printf("%-*s: %s\n", w, "durable-ack p95", harness.Dur(hDur.Pct(95)))
-		fmt.Printf("%-*s: %s\n", w, "durable-ack p99", harness.Dur(hDur.Pct(99)))
-		fmt.Printf("%-*s: %s\n", w, "durable-ack max", harness.Dur(hDur.Max()))
+		fmt.Printf("%-*s: %s\n", w, ackName+" average", harness.Dur(hDur.Avg()))
+		fmt.Printf("%-*s: %s\n", w, ackName+" median(p50)", harness.Dur(hDur.Pct(50)))
+		fmt.Printf("%-*s: %s\n", w, ackName+" p95", harness.Dur(hDur.Pct(95)))
+		fmt.Printf("%-*s: %s\n", w, ackName+" p99", harness.Dur(hDur.Pct(99)))
+		fmt.Printf("%-*s: %s\n", w, ackName+" max", harness.Dur(hDur.Max()))
 	}
 }

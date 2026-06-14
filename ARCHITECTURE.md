@@ -26,11 +26,12 @@
 7. [Balance Authority: Single-Writer Ledger](#7-balance-authority-single-writer-ledger)
 8. [Order Book & Matching Engine](#8-order-book--matching-engine)
 9. [Write-Ahead Log (Journaller)](#9-write-ahead-log-journaller)
-10. [Snapshot & Recovery](#10-snapshot--recovery)
-11. [Siklus Hidup Sebuah Order (End-to-End)](#11-siklus-hidup-sebuah-order-end-to-end)
-12. [Strategi Multi-Core: Serial vs Paralel](#12-strategi-multi-core-serial-vs-paralel)
-13. [Performa & Zero-Alloc](#13-performa--zero-alloc)
-14. [Peta Paket](#14-peta-paket)
+10. [Replikasi & Hot Standby](#10-replikasi--hot-standby)
+11. [Snapshot & Recovery](#11-snapshot--recovery)
+12. [Siklus Hidup Sebuah Order (End-to-End)](#12-siklus-hidup-sebuah-order-end-to-end)
+13. [Strategi Multi-Core: Serial vs Paralel](#13-strategi-multi-core-serial-vs-paralel)
+14. [Performa & Zero-Alloc](#14-performa--zero-alloc)
+15. [Peta Paket](#15-peta-paket)
 
 ---
 
@@ -149,11 +150,10 @@ flowchart LR
         E_IN["SPSC RingCommand<br/>(ingress)"]
         E_UM["DecodeCommand<br/>(codec WAL)"]
         E_JR["WAL Writer<br/>(internal/wal)"]
-        E_RP["Raft replicator<br/>(out-of-scope v1)"]
+        E_RP["Replicator → hot standby<br/>(AsyncReplicator + StandbyLink)"]
         E_BLP["Sequencer + Ledger<br/>+ Market Shards"]
-        E_OUT["Acks (gated<br/>oleh DurableSeq)"]
-        E_IN --> E_UM & E_JR --> E_BLP --> E_OUT
-        E_RP -.->|"v1: belum ada"| E_BLP
+        E_OUT["Acks (gated oleh<br/>min(durableSeq, replicatedSeq))"]
+        E_IN --> E_UM & E_JR & E_RP --> E_BLP --> E_OUT
     end
 
     L_UM -.-> E_UM
@@ -168,7 +168,7 @@ flowchart LR
 | **Business Logic Processor** | sequencer + balance + market shard | `internal/sequencer`, `internal/balance`, `internal/market` |
 | **Input disruptor** | SPSC ring ingress + reinject | `internal/spsc` |
 | **Journaller** | seam `Journaller` (sync inline / **async goroutine konsumer**) di atas WAL segmented+CRC+group-commit | `internal/sequencer/journaller.go`, `async_journaller.go`, `internal/wal` |
-| **Replicator** | replikasi Raft (**out-of-scope v1**) | — |
+| **Replicator** | konsumer kedua atas stream ber-`Seq` (mirror `AsyncJournaller`) yang stream ke **hot standby** lewat seam `StandbyLink`; promosi manual ber-*epoch fence*, mode `off`/`sync`/`async` | `internal/sequencer/replicator.go`, `async_replicator.go`, `internal/market/standby.go` |
 | **Un-marshaller** | `types.DecodeCommand` (codec WAL) | `internal/types/codec.go` |
 | **Sequence barrier (persist sebelum lepas output)** | *durable-ack barrier* — ack hanya rilis di bawah `DurableSeq` | `internal/sequencer/sequencer.go` |
 | **Single Writer Principle** | ledger single-writer + book single-owner | `internal/balance`, `internal/orderbook` |
@@ -178,9 +178,13 @@ flowchart LR
 > **Catatan jujur:** dalam mode **async**, *Journaller* kini benar-benar jadi
 > consumer paralel atas stream command — pola input-disruptor LMAX yang
 > sesungguhnya (matcher & Journaller jalan bersamaan, barrier sebelum lepas
-> output). *Replicator* (HA via Raft) belum ada di v1. *Output disruptor* di v1
-> berupa buffer ack yang dirilis bertahap sesuai watermark durable, bukan ring
-> publisher penuh. Keduanya dirancang masuk di fase HA.
+> output). *Replicator* kini ada juga: konsumer kedua yang stream ke **hot
+> standby** dan menerbitkan `replicatedSeq`; di mode `sync` ack di-gate
+> `min(durableSeq, replicatedSeq)` (lihat §10). Yang **belum** ada di v1: transport
+> jaringan di balik seam `StandbyLink` (v1 in-process), pemilihan leader otomatis
+> (promosi masih manual ber-*epoch fence*), dan rejoin in-engine primary lama
+> (sementara: runbook operator wipe-and-resync). *Output disruptor* di v1 berupa
+> buffer ack yang dirilis bertahap sesuai watermark, bukan ring publisher penuh.
 
 ---
 
@@ -695,7 +699,82 @@ ada goroutine/core tambahan.
 
 ---
 
-## 10. Snapshot & Recovery
+## 10. Replikasi & Hot Standby
+
+*Replicator* LMAX = **konsumer kedua** atas stream command ber-`Seq`, kembaran
+struktural dari Journaller (§9.4). Di engine ini ia stream tiap command ke sebuah
+**hot standby** sehingga sebuah node sekunder bisa mengambil alih saat primary
+mati — **zero confirmed-order loss** di mode sync. Dipilih lewat
+`OB_REPLICATION_MODE` = `off` (default) / `sync` / `async`.
+
+> **Status v1:** data-plane in-process **sudah ada & teruji** (differential,
+> property, fuzz, chaos). Yang ditunda: transport jaringan di balik seam
+> `StandbyLink`, pemilihan leader otomatis (promosi masih **manual**), dan rejoin
+> in-engine primary lama (sementara: runbook operator *wipe-and-resync*).
+
+### 10.1 Komponen
+
+| Bagian | Peran | Lokasi |
+|---|---|---|
+| `Replicator` (seam) | mirror `Journaller`: `Replicate/Flush/Drain/ReplicatedSeq/Fatal/Close`; `NopReplicator` = mode `off` (`ReplicatedSeq=+inf`) | `internal/sequencer/replicator.go` |
+| `AsyncReplicator` | konsumer off-thread; `Replicate` **non-blocking** (ring penuh → standby mundur ke catch-up dari WAL, **bukan** stall sequencer) | `internal/sequencer/async_replicator.go` |
+| `StandbyLink` (seam) | transport: `Send/AckedSeq/Fetch/Fatal/Close`; impl in-process menggerakkan `Standby` | `internal/sequencer/replicator.go`, `internal/market/standby.go` |
+| `Standby` | shadow `Engine` mode *suppress-stops* (postur replay) yang apply stream via `ApplyJournaled` dengan **guard dup-Seq** (`ApplyJournaled` tidak idempoten) | `internal/market/standby.go` |
+
+### 10.2 Sync vs Async — bedanya **hanya di gerbang ack**
+
+Streaming-nya **selalu** off-thread (`AsyncReplicator`) di kedua mode; yang
+membedakan hanyalah apakah ack menunggu standby:
+
+| Mode | Gerbang ack (`ReleaseSeq`) | Arti |
+|---|---|---|
+| **`sync`** | `min(durableSeq, replicatedSeq)` | command *confirmed* hanya setelah **durable DAN ter-replikasi** — zero loss saat failover, tapi standby ada di jalur kritis |
+| **`async`** | `durableSeq` saja | replikasi **di luar** jalur kritis (lag terbatas); ack lepas begitu durable, standby boleh tertinggal |
+| **`off`** | `durableSeq` saja | tanpa standby (`replicatedSeq=+inf` → `min` runtuh ke `durableSeq`) |
+
+Karena `Replicate` non-blocking, throughput primary praktis tak berubah di kedua
+mode (standby yang mengejar, bukan sequencer yang menunggu). Gerbang ada di
+`releaseGate` (`internal/market/engine.go`), dipakai identik oleh topologi serial
+& paralel.
+
+### 10.3 Promosi ber-epoch-fence (anti split-brain)
+
+Setiap command di-*stamp* `Epoch` (term kepemimpinan) oleh sequencer.
+`Standby.Promote()`: naikkan epoch → prime `Seq`/`Epoch` engine → `EnableStops` →
+jadi primary live. Sebuah record dengan **epoch lebih lama** (primary zombie yang
+hidup lagi) **di-fence**: tidak ada Seq dikonsumsi, tidak ada mutasi state — di
+jalur apply maupun jalur replay (`recover.go` → `ErrStaleEpoch`). Epoch ikut
+tersimpan di header snapshot, jadi fencing bertahan lintas restart dingin.
+
+### 10.4 Degrade-to-solo & re-arm
+
+`CmdDegradeToSolo`/`CmdRearm` adalah **record kontrol** ber-`Seq` (no-op ke
+book/ledger) yang membalik gerbang sync → `durableSeq` saja saat standby tumbang
+(operator-armed), lalu kembali. Karena ter-journal, mode di-rekonstruksi
+deterministik saat replay dan disimpan di snapshot (`secReplication`); ia **tidak**
+masuk `StateFingerprint`, jadi primary yang degraded tetap *fingerprint-equal*
+dengan standby-nya.
+
+### 10.5 Backpressure & catch-up
+
+Ring replikator penuh **tidak** menghentikan sequencer (beda dari Journaller yang
+spin): command di-drop dari ring (masih durable di WAL) dan consumer mengejar via
+`StandbyLink.Fetch` (dibatasi `fetchCap` per panggilan, ber-batch). Standby yang
+restart/tertinggal re-sync dari snapshot + WAL tail dan konvergen ke
+*fingerprint-equality* — diuji oleh `INV-REP-01/02`, `RunDifferentialReplicated`,
+dan chaos suite (primary-crash → promosi mempertahankan tiap confirmed order).
+
+### 10.6 Lifecycle: Drain ≠ DrainStandby ≠ Close
+
+- **`Drain`** — kuras command + durabilitas WAL primary (tidak menunggu standby).
+- **`DrainStandby`** — catch-up standby secara *graceful* (dipakai snapshot quiesce
+  & assertion konvergensi).
+- **`Close`** — stop **abrupt** (membuang lag standby, seperti crash) — supaya
+  beban open-loop maksimum tidak menggantung shutdown.
+
+---
+
+## 11. Snapshot & Recovery
 
 ### 10.1 Snapshot: lima section dalam satu container WAL
 
@@ -737,7 +816,7 @@ engine *fail-over* ke replay WAL penuh dari `Seq 0` (dicatat di log).
 
 ---
 
-## 11. Siklus Hidup Sebuah Order (End-to-End)
+## 12. Siklus Hidup Sebuah Order (End-to-End)
 
 Menyatukan semuanya — sebuah limit-buy yang sebagian langsung match:
 
@@ -773,7 +852,7 @@ sequenceDiagram
 
 ---
 
-## 12. Strategi Multi-Core: Serial vs Paralel
+## 13. Strategi Multi-Core: Serial vs Paralel
 
 Inilah inti "menggunakan core yang berbeda-beda". Engine punya **dua topologi**
 yang berbagi sequencer + ledger yang sama.
@@ -897,7 +976,7 @@ Di mode **async**, Journaller menempati core sendiri — itulah pertukarannya:
 
 ---
 
-## 13. Performa & Zero-Alloc
+## 14. Performa & Zero-Alloc
 
 Target & hasil terukur (mesin dev: Apple M2, Darwin — pinning no-op):
 
@@ -935,7 +1014,7 @@ untuk kontrak korektnes (`INV-*`) yang diuji via property / differential / fuzz.
 
 ---
 
-## 14. Peta Paket
+## 15. Peta Paket
 
 ```
 cmd/engine          # wiring in-process: recovery startup, cadence snapshot, shutdown

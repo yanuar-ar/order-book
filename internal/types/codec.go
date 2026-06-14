@@ -9,7 +9,7 @@ import (
 // in declaration order, packed little-endian, no padding — exactly what
 // encoding/binary produces for the struct. The byte layout is a durability
 // contract; changing it breaks replay of existing WALs.
-const CommandSize = 102
+const CommandSize = 110
 
 // EncodeCommandInto writes c into dst in the stable little-endian layout and
 // returns the number of bytes written. dst must have len >= CommandSize. It
@@ -37,6 +37,7 @@ func EncodeCommandInto(dst []byte, c Command) int {
 	le.PutUint64(dst[78:86], uint64(c.Amount))
 	le.PutUint64(dst[86:94], c.ClientReqID)
 	le.PutUint64(dst[94:102], uint64(c.ClientTsNanos))
+	le.PutUint64(dst[102:110], c.Epoch)
 	return CommandSize
 }
 

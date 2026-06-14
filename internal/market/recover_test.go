@@ -17,7 +17,7 @@ func TestRestore_SelfCheckRejectsLogicalCorruption(t *testing.T) {
 		t.Fatalf("snapshot: %v", err)
 	}
 
-	seq, sections, err := wal.ReadSnapshot(good)
+	seq, epoch, sections, err := wal.ReadSnapshot(good)
 	if err != nil {
 		t.Fatalf("read snapshot: %v", err)
 	}
@@ -31,7 +31,7 @@ func TestRestore_SelfCheckRejectsLogicalCorruption(t *testing.T) {
 	led[len(led)-5] ^= 0xFF
 
 	bad := filepath.Join(t.TempDir(), "bad")
-	if err := wal.WriteSnapshot(bad, seq, sections); err != nil {
+	if err := wal.WriteSnapshot(bad, seq, epoch, sections); err != nil {
 		t.Fatalf("write tampered snapshot: %v", err)
 	}
 

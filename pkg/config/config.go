@@ -31,6 +31,14 @@ type Config struct {
 	JournalMode string
 	JournalRing uint64
 
+	// Replication (hot standby). ReplicationMode selects "off" (no standby),
+	// "sync" (acks wait for the standby to durably apply — zero confirmed-order
+	// loss on failover), or "async" (stream to the standby off the critical path,
+	// bounded lag). ReplicationRing sizes the async hand-off ring to the
+	// replicator consumer (power of two, or 0 for the engine default).
+	ReplicationMode string
+	ReplicationRing uint64
+
 	// Snapshot durability. Snapshots are a restart-speed optimization layered on
 	// the full WAL; the WAL itself is never truncated in v1.
 	SnapshotPath         string // snapshot directory; distinct from WALPath
@@ -94,6 +102,9 @@ func Default() Config {
 
 		JournalMode: "sync",
 		JournalRing: 0, // engine default
+
+		ReplicationMode: "off",
+		ReplicationRing: 0, // engine default
 
 		SnapshotPath:         "./data/snapshots",
 		SnapshotEveryN:       0,    // time-based by default
@@ -159,6 +170,12 @@ func Load(getenv func(string) string) (Config, error) {
 		c.JournalMode = v
 	}
 	if c.JournalRing, err = envUint(getenv, "OB_JOURNAL_RING", c.JournalRing); err != nil {
+		return Config{}, err
+	}
+	if v := getenv("OB_REPLICATION_MODE"); v != "" {
+		c.ReplicationMode = v
+	}
+	if c.ReplicationRing, err = envUint(getenv, "OB_REPLICATION_RING", c.ReplicationRing); err != nil {
 		return Config{}, err
 	}
 	if v := getenv("OB_SNAPSHOT_PATH"); v != "" {
@@ -264,6 +281,12 @@ func (c Config) Validate() error {
 	}
 	if c.JournalRing != 0 && c.JournalRing&(c.JournalRing-1) != 0 {
 		return fmt.Errorf("config: OB_JOURNAL_RING must be a power of two (or 0 for the default), got %d", c.JournalRing)
+	}
+	if c.ReplicationMode != "off" && c.ReplicationMode != "sync" && c.ReplicationMode != "async" {
+		return fmt.Errorf("config: OB_REPLICATION_MODE must be \"off\", \"sync\", or \"async\", got %q", c.ReplicationMode)
+	}
+	if c.ReplicationRing != 0 && c.ReplicationRing&(c.ReplicationRing-1) != 0 {
+		return fmt.Errorf("config: OB_REPLICATION_RING must be a power of two (or 0 for the default), got %d", c.ReplicationRing)
 	}
 	if c.PriceScale <= 0 || c.QtyScale <= 0 || c.FeeScale <= 0 {
 		return fmt.Errorf("config: scales must be positive (price=%d qty=%d fee=%d)", c.PriceScale, c.QtyScale, c.FeeScale)

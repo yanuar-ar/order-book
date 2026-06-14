@@ -98,15 +98,15 @@ func TestSnapshotRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "snap")
 	sections := [][]byte{[]byte("book0-state"), []byte("ledger-state")}
-	if err := WriteSnapshot(path, 42, sections); err != nil {
+	if err := WriteSnapshot(path, 42, 9, sections); err != nil {
 		t.Fatalf("WriteSnapshot: %v", err)
 	}
-	seq, got, err := ReadSnapshot(path)
+	seq, epoch, got, err := ReadSnapshot(path)
 	if err != nil {
 		t.Fatalf("ReadSnapshot: %v", err)
 	}
-	if seq != 42 || len(got) != 2 || string(got[0]) != "book0-state" || string(got[1]) != "ledger-state" {
-		t.Fatalf("snapshot round-trip mismatch: seq %d sections %q", seq, got)
+	if seq != 42 || epoch != 9 || len(got) != 2 || string(got[0]) != "book0-state" || string(got[1]) != "ledger-state" {
+		t.Fatalf("snapshot round-trip mismatch: seq %d epoch %d sections %q", seq, epoch, got)
 	}
 }
 
@@ -137,11 +137,11 @@ func TestCorruptMidStreamErrors(t *testing.T) {
 func TestBadSnapshotCRC(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "snap")
-	WriteSnapshot(path, 7, [][]byte{[]byte("x")})
+	WriteSnapshot(path, 7, 0, [][]byte{[]byte("x")})
 	buf, _ := os.ReadFile(path)
 	buf[4] ^= 0xFF // corrupt the seq field; CRC must catch it
 	os.WriteFile(path, buf, 0o644)
-	if _, _, err := ReadSnapshot(path); err != ErrBadSnapshot {
+	if _, _, _, err := ReadSnapshot(path); err != ErrBadSnapshot {
 		t.Fatalf("ReadSnapshot err = %v, want ErrBadSnapshot", err)
 	}
 }

@@ -22,7 +22,7 @@ func BenchmarkAppend(b *testing.B) {
 		b.Fatalf("OpenWriter: %v", err)
 	}
 	defer w.Close()
-	payload := make([]byte, 102) // CommandSize-shaped payload
+	payload := make([]byte, 110) // CommandSize-shaped payload
 	rec := Record{Seq: 1, TsNanos: 1, Type: 0, Payload: payload}
 	b.ReportAllocs()
 	b.ResetTimer()

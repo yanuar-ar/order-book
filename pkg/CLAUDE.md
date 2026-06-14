@@ -10,7 +10,8 @@ rates, journaling mode, and snapshot cadence/retention/path) loaded from
 environment variables, read **once at startup**. Journaling keys:
 `OB_JOURNAL_MODE` (`sync` default, or `async` for off-thread fsync — the 1M
 durable path) and `OB_JOURNAL_RING` (async hand-off ring size; power of two or 0
-for the engine default). Snapshot keys: `OB_SNAPSHOT_PATH` (must differ from
+for the engine default). Replication keys: `OB_REPLICATION_MODE` (`off` default,
+or `sync`/`async` hot-standby) and `OB_REPLICATION_RING` (power of two or 0). Snapshot keys: `OB_SNAPSHOT_PATH` (must differ from
 `OB_WAL_PATH`), `OB_SNAPSHOT_EVERY` (count) / `OB_SNAPSHOT_INTERVAL` (seconds;
 at least one > 0), `OB_SNAPSHOT_RETAIN` (>= 1). No
 third-party dependencies. `Default()` supplies built-in defaults; `Load(getenv)`

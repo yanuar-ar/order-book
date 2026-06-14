@@ -41,6 +41,7 @@ func run(t *testing.T, e *Engine, cmds ...types.Command) {
 		}
 	}
 	e.Drain()
+	_ = e.DrainStandby() // catch the hot standby up too (no-op when replication is off)
 }
 
 // ---- U3: ack-release gate ----
