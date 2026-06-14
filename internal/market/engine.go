@@ -42,6 +42,12 @@ type Core struct {
 	acks     []types.Ack // captured for tests/publisher
 	filters  map[types.MarketID]types.MarketFilters
 	qtyScale int64
+	// degraded is the replication ack-gate mode: when true, acks gate on
+	// durability alone (the standby requirement is dropped). It is flipped by the
+	// CmdDegradeToSolo / CmdRearm control records, so it is reconstructed
+	// deterministically on replay; it is output-side only and is NOT part of the
+	// state fingerprint.
+	degraded bool
 }
 
 // OnSettlement is unused in single-threaded mode (fills settle inline in
@@ -67,6 +73,12 @@ func (c *Core) OnCommand(cmd types.Command) {
 		c.amend(cmd)
 	case types.CmdNewOrder:
 		c.newOrder(cmd)
+	case types.CmdDegradeToSolo:
+		c.degraded = true // drop the replication requirement (output-side only)
+		c.ack(cmd, types.AckAccepted, types.ReasonNone)
+	case types.CmdRearm:
+		c.degraded = false // restore sync gating
+		c.ack(cmd, types.AckAccepted, types.ReasonNone)
 	}
 }
 
@@ -366,6 +378,10 @@ func (e *Engine) Close() error {
 // for fingerprint/invariant comparison and promotion.
 func (e *Engine) Standby() *Standby { return e.standby }
 
+// Degraded reports whether the replication ack-gate is in solo mode (acks gate on
+// durability alone). Output-side state; reconstructed deterministically on replay.
+func (e *Engine) Degraded() bool { return e.core.degraded }
+
 // balanceConfig derives the ledger config from the engine config.
 func balanceConfig(cfg Config) balance.Config {
 	return balance.Config{
@@ -426,7 +442,20 @@ func (e *Engine) MarketIDs() []types.MarketID {
 // Acks above durableSeq are speculative (their command is matched in-memory but
 // not yet on disk) and must not be observed until a flush makes them durable.
 // After Drain the watermark equals Seq, so every ack is released.
-func (e *Engine) Acks() []types.Ack { return releasedAcks(e.core.acks, e.seq.ReleaseSeq()) }
+func (e *Engine) Acks() []types.Ack { return releasedAcks(e.core.acks, releaseGate(e.seq, e.core)) }
+
+// releaseGate is the highest Seq whose ack is safe to release. In the normal
+// (synced) mode it is the sequencer's min(durableSeq, replicatedSeq); once a
+// degrade-to-solo is in effect the replication requirement is dropped and the
+// gate is durableSeq alone. The degraded flag lives on the Core so it replays
+// deterministically; the watermarks live on the shared sequencer, so serial and
+// parallel engines gate identically.
+func releaseGate(seq *sequencer.Sequencer, core *Core) types.Seq {
+	if core.degraded {
+		return seq.DurableSeq()
+	}
+	return seq.ReleaseSeq()
+}
 
 // AcksAll returns every ack appended so far, ungated by durability — for
 // benchmark harnesses that track the durable watermark (DurableSeq) themselves

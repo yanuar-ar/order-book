@@ -261,7 +261,7 @@ func (pe *ParallelEngine) Filters() map[types.MarketID]types.MarketFilters { ret
 // watermark lives on the shared sequencer, so serial and parallel engines gate
 // identically — including the replication gate.
 func (pe *ParallelEngine) Acks() []types.Ack {
-	return releasedAcks(pe.core.acks, pe.seq.ReleaseSeq())
+	return releasedAcks(pe.core.acks, releaseGate(pe.seq, pe.core))
 }
 
 // AcksAll returns every ack appended so far, ungated by durability (see

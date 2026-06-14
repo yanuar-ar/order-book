@@ -21,6 +21,7 @@ const (
 	secOpenMap
 	secBooks
 	secStops
+	secReplication // output-side replication gate mode (degraded); not in the fingerprint
 	secCount
 )
 
@@ -50,6 +51,7 @@ func (e *Engine) Snapshot(path string) error {
 	sections[secOpenMap] = encodeOpenMap(e.core.open)
 	sections[secBooks] = e.encodeBooks()
 	sections[secStops] = e.encodeStops()
+	sections[secReplication] = []byte{boolByte(e.core.degraded)}
 	return wal.WriteSnapshot(path, uint64(e.seq.Seq()), e.seq.Epoch(), sections)
 }
 
@@ -95,6 +97,9 @@ func Restore(cfg Config, path string) (*Engine, error) {
 
 	e.SetSeq(types.Seq(seq))
 	e.SetEpoch(epoch)
+	if rep := sections[secReplication]; len(rep) > 0 {
+		e.core.degraded = rep[0] != 0
+	}
 
 	if err := e.selfCheck(); err != nil {
 		return nil, err
@@ -124,6 +129,13 @@ func (e *Engine) StateFingerprint() []byte {
 		out = append(out, p...)
 	}
 	return out
+}
+
+func boolByte(b bool) byte {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // encodeHeader serializes the format version, the money-scale config the ledger

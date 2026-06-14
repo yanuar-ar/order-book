@@ -71,6 +71,14 @@ const (
 	CmdAmend
 	CmdDeposit
 	CmdWithdraw
+	// CmdDegradeToSolo and CmdRearm are replication control records: they flip the
+	// ack-gate mode and are no-ops to book/ledger state. DegradeToSolo drops the
+	// replication requirement (acks gate on durability alone — operator-armed when
+	// the standby is down); Rearm restores sync gating once the standby is back.
+	// Being journaled commands they replay deterministically, so the gate mode is
+	// reconstructed on recovery without living in the state fingerprint.
+	CmdDegradeToSolo
+	CmdRearm
 )
 
 // Command is a fixed-size, pointer-free external command. It is written
