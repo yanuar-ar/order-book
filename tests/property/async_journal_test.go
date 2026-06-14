@@ -105,6 +105,28 @@ func TestAsyncSameSeedDeterministic(t *testing.T) {
 	}
 }
 
+// TestDifferentialAsyncMatchesOracle (U7): the async-journaller engine agrees
+// with the independent reference oracle on canonical state and every invariant
+// after each command, across the broad and sharp generators.
+func TestDifferentialAsyncMatchesOracle(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		s    Stream
+	}{
+		{"broad-1", GenBroad(1, 1000)},
+		{"broad-42", GenBroad(42, 1000)},
+		{"sharp-2", GenSharp(2, 1000)},
+		{"sharp-99", GenSharp(99, 1000)},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			if err := RunDifferentialAsync(tc.s); err != nil {
+				t.Fatalf("async engine diverged from oracle: %v", err)
+			}
+		})
+	}
+}
+
 // TestAsyncWatermarkInvariants exercises INV-JRN-02/03/04 dynamically: across a
 // run the durable watermark is monotonic and never exceeds Seq, every exposed
 // ack is at or below it, and after Drain it equals Seq.

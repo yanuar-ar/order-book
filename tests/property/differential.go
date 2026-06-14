@@ -44,6 +44,18 @@ func RunDifferential(stream Stream) error {
 	return runDifferential(market.NewEngine(engineCfg()), stream)
 }
 
+// RunDifferentialAsync runs the differential check with the AsyncJournaller wired
+// in, proving off-thread journaling is behavior-transparent: the engine still
+// matches the reference oracle and holds every invariant after each command.
+func RunDifferentialAsync(stream Stream) error {
+	cfg := engineCfg()
+	cfg.AsyncJournal = true
+	cfg.JournalCore = -1
+	e := market.NewEngine(cfg)
+	defer e.Close()
+	return runDifferential(e, stream)
+}
+
 // RunDifferentialParallel runs the same check against the ParallelEngine with
 // the given worker grouping, proving the parallel topology matches the oracle
 // (and therefore the serial engine) across every order type.
