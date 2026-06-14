@@ -32,8 +32,15 @@ type Record struct {
 	Payload []byte
 }
 
-func encodeRecord(r Record) []byte {
-	buf := make([]byte, headerSize+len(r.Payload))
+// encodeRecordInto frames r into dst, growing dst only when its capacity is too
+// small, and returns the framed slice. Reusing a caller-owned dst across calls
+// makes the hot append path zero-alloc; the returned slice aliases dst.
+func encodeRecordInto(dst []byte, r Record) []byte {
+	total := headerSize + len(r.Payload)
+	if cap(dst) < total {
+		dst = make([]byte, total)
+	}
+	buf := dst[:total]
 	binary.LittleEndian.PutUint64(buf[0:8], r.Seq)
 	binary.LittleEndian.PutUint64(buf[8:16], uint64(r.TsNanos))
 	binary.LittleEndian.PutUint16(buf[16:18], r.Type)
@@ -42,6 +49,12 @@ func encodeRecord(r Record) []byte {
 	binary.LittleEndian.PutUint32(buf[24:28], crc32.ChecksumIEEE(r.Payload))
 	copy(buf[headerSize:], r.Payload)
 	return buf
+}
+
+// encodeRecord frames r into a freshly allocated buffer. Off-hot-path helper
+// (tests); the hot append path uses the reusable encodeRecordInto.
+func encodeRecord(r Record) []byte {
+	return encodeRecordInto(nil, r)
 }
 
 // decodeRecord parses a record at buf[off:]. consumed is the number of bytes

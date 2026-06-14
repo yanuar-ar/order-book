@@ -16,6 +16,7 @@ type Writer struct {
 	idx     int
 	cur     *os.File
 	curSize int64
+	encBuf  []byte // reusable framing buffer; keeps Append zero-alloc
 }
 
 // OpenWriter creates (or reuses) the log directory and opens a fresh segment.
@@ -60,8 +61,13 @@ func (w *Writer) openSegment() error {
 
 // Append writes one record, rolling to a new segment when the current one would
 // exceed the segment size. The bytes are not durable until Sync returns.
+//
+// Append frames into a reusable buffer and copies r.Payload, so it does not
+// retain r.Payload after returning — the caller may pass a reusable payload
+// buffer. Single-writer only (the sequencer goroutine).
 func (w *Writer) Append(r Record) error {
-	enc := encodeRecord(r)
+	w.encBuf = encodeRecordInto(w.encBuf, r)
+	enc := w.encBuf
 	if w.curSize > 0 && w.curSize+int64(len(enc)) > w.segSize {
 		if err := w.roll(); err != nil {
 			return err

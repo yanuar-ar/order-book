@@ -9,9 +9,16 @@ import (
 	"github.com/yanuar-ar/order-book/internal/wal"
 )
 
+// cloneRecord copies a record's payload so a retaining test journal honors the
+// Journal.Append no-retain contract (the sequencer reuses its payload buffer).
+func cloneRecord(r wal.Record) wal.Record {
+	r.Payload = append([]byte(nil), r.Payload...)
+	return r
+}
+
 type fakeJournal struct{ recs []wal.Record }
 
-func (j *fakeJournal) Append(r wal.Record) error { j.recs = append(j.recs, r); return nil }
+func (j *fakeJournal) Append(r wal.Record) error { j.recs = append(j.recs, cloneRecord(r)); return nil }
 
 // failingJournal fails Append on the failAt-th call (1-based), succeeding before.
 type failingJournal struct {
@@ -26,7 +33,7 @@ func (j *failingJournal) Append(r wal.Record) error {
 	if j.calls == j.failAt {
 		return j.err
 	}
-	j.recs = append(j.recs, r)
+	j.recs = append(j.recs, cloneRecord(r))
 	return nil
 }
 
@@ -230,8 +237,11 @@ type syncingJournal struct {
 	syncs int
 }
 
-func (j *syncingJournal) Append(r wal.Record) error { j.recs = append(j.recs, r); return nil }
-func (j *syncingJournal) Sync() error               { j.syncs++; return nil }
+func (j *syncingJournal) Append(r wal.Record) error {
+	j.recs = append(j.recs, cloneRecord(r))
+	return nil
+}
+func (j *syncingJournal) Sync() error { j.syncs++; return nil }
 
 func drainSeq(s *Sequencer) {
 	for s.Step() {
