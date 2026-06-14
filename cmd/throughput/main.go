@@ -263,6 +263,8 @@ func printSummary(topology string, n, warmup int, rngseed int64, durable, async 
 	fmt.Printf("throughput        : %.0f cmd/s\n", float64(processed)/elapsed.Seconds())
 	fmt.Printf("produced          : %d\n", produced)
 	fmt.Printf("backpressure      : %d (producer waited for the engine)\n", backpressure)
-	fmt.Printf("latency p50/p95/p99/max (engine step): %s / %s / %s / %s\n",
-		harness.Dur(h.Pct(50)), harness.Dur(h.Pct(95)), harness.Dur(h.Pct(99)), harness.Dur(h.Max()))
+	fmt.Printf("engine step latency p50: %s\n", harness.Dur(h.Pct(50)))
+	fmt.Printf("engine step latency p95: %s\n", harness.Dur(h.Pct(95)))
+	fmt.Printf("engine step latency p99: %s\n", harness.Dur(h.Pct(99)))
+	fmt.Printf("engine step latency max: %s\n", harness.Dur(h.Max()))
 }

@@ -15,6 +15,7 @@ import (
 	"flag"
 	"fmt"
 	"math/rand"
+	"os"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -23,6 +24,7 @@ import (
 	"github.com/yanuar-ar/order-book/internal/orderbook"
 	"github.com/yanuar-ar/order-book/internal/platform"
 	"github.com/yanuar-ar/order-book/internal/types"
+	"github.com/yanuar-ar/order-book/internal/wal"
 )
 
 func newRand(seed int64) *rand.Rand { return rand.New(rand.NewSource(seed)) }
@@ -35,13 +37,46 @@ func main() {
 	levels := flag.Int("levels", 16, "order-book depth levels to show per side")
 	topology := flag.String("topology", "serial", "engine topology: serial | parallel")
 	cores := flag.String("cores", "0;1,2", "parallel only: market->worker map ('0;1,2')")
+	durable := flag.Bool("durable", false, "journal to a real WAL (group-commit fsync) and measure durable-ack latency")
+	async := flag.Bool("async", false, "journal off the matcher goroutine (AsyncJournaller). Requires -durable")
+	flushCap := flag.Int("flushcap", 0, "group-commit batch ceiling (commands per fsync; 0 = engine default)")
+	walDir := flag.String("wal", "", "WAL directory for -durable (default: a temp dir, removed on exit)")
 	flag.Parse()
 
 	var groups [][]types.MarketID
 	if *topology == "parallel" {
 		groups = harness.ParseCores(*cores)
 	}
-	eng, cleanup, err := harness.BuildEngine(*topology, groups, harness.DefaultConfig())
+	if *async && !*durable {
+		fmt.Println("-async requires -durable (nothing to fsync off-thread without a real WAL)")
+		return
+	}
+	cfg := harness.DefaultConfig()
+	cfg.FlushCap = *flushCap
+	if *durable {
+		dir := *walDir
+		if dir == "" {
+			d, err := os.MkdirTemp("", "loadtest-wal-")
+			if err != nil {
+				fmt.Println("temp WAL dir:", err)
+				return
+			}
+			dir = d
+			defer os.RemoveAll(dir)
+		}
+		w, err := wal.OpenWriter(dir, 0)
+		if err != nil {
+			fmt.Println("open WAL:", err)
+			return
+		}
+		defer w.Close() // LIFO: runs after cleanup() closes the engine/journaller
+		cfg.Journal = w
+		if *async {
+			cfg.AsyncJournal = true
+			cfg.JournalBatchCap = *flushCap
+		}
+	}
+	eng, cleanup, err := harness.BuildEngine(*topology, groups, cfg)
 	if err != nil {
 		println(err.Error())
 		return
@@ -54,6 +89,7 @@ func main() {
 	r := newRand(1)
 	harness.Fund(eng, *users)
 	harness.SeedBook(eng, r, *users)
+	eng.Drain() // quiesce setup so the load phase starts from a seeded, durable book
 
 	// Prefetch books so the generation hot path and the TUI never touch a map.
 	var books [3]*orderbook.Book
@@ -61,13 +97,15 @@ func main() {
 		books[m] = eng.Shard(m).Book()
 	}
 
-	h := harness.NewHist()
+	h := harness.NewHist()          // match latency: intended -> matched (internal SLO)
+	hDur := harness.NewHist()       // durable-ack latency: intended -> WAL-durable (production SLO)
+	ackCursor := len(eng.AcksAll()) // skip setup (deposit/seed) acks
 	var framePtr atomic.Pointer[harness.Frame]
 	stop := make(chan struct{})
 	go harness.DisplayLoop(&framePtr, stop)
 
 	title := "spot order-book load test"
-	sub := topologyLine(*topology, groups)
+	sub := topologyLine(*topology, groups) + "  " + journalLabel(*durable, *async)
 
 	interval := time.Duration(int64(time.Second) / int64(*tps))
 	start := time.Now()
@@ -84,12 +122,29 @@ func main() {
 		}
 		id++
 		c := harness.GenLiveMid(&books, r, id, *users) // book read: between steps, workers idle
+		c.ClientTsNanos = intended.UnixNano()          // stamp for durable-ack correlation
 		if !eng.Submit(c) {
 			backpressure++
 		}
 		eng.Step()
 		done := time.Now()
-		h.Record(done.Sub(intended).Nanoseconds()) // measured from intended (coordinated-omission-correct)
+		h.Record(done.Sub(intended).Nanoseconds()) // match latency (coordinated-omission-correct)
+		if *durable {
+			// Durable-ack latency: advance a cursor over the ungated ack log up to
+			// the durable watermark (O(1) amortized — no O(prefix) rescan), and
+			// record each newly-durable ack from its intended time.
+			raw := eng.AcksAll()
+			d := eng.DurableSeq()
+			nowNs := done.UnixNano()
+			for ackCursor < len(raw) && raw[ackCursor].Seq <= d {
+				lat := nowNs - raw[ackCursor].ClientTsNanos
+				if lat < 0 {
+					lat = 0
+				}
+				hDur.Record(lat)
+				ackCursor++
+			}
+		}
 		i++
 
 		if done.After(nextFrame) {
@@ -106,7 +161,18 @@ func main() {
 
 	final := harness.BuildFrame(eng, types.MarketID(*view), *levels, h, title, sub, i, time.Since(start), backpressure)
 	harness.Render(final)
-	printSummary(final)
+	printSummary(final, hDur, *durable, *async)
+}
+
+// journalLabel describes the journaling path for the TUI sub-line and summary.
+func journalLabel(durable, async bool) string {
+	if !durable {
+		return "no-op journal"
+	}
+	if async {
+		return "durable WAL (async, off-thread fsync)"
+	}
+	return "durable WAL (sync)"
 }
 
 // topologyLine is the TUI sub-line: a plain note for serial, the worker layout
@@ -126,15 +192,31 @@ func topologyLine(topology string, groups [][]types.MarketID) string {
 	return "topology parallel  " + strings.Join(parts, "  ")
 }
 
-func printSummary(f *harness.Frame) {
+func printSummary(f *harness.Frame, hDur *harness.Hist, durable, async bool) {
 	fmt.Printf("\n==== load test complete ====\n")
 	fmt.Printf("commands processed : %d\n", f.Count)
 	fmt.Printf("duration           : %.1fs\n", f.Elapsed.Seconds())
 	fmt.Printf("throughput         : %.0f cmd/s\n", f.TPS)
 	fmt.Printf("backpressure       : %d\n", f.BP)
-	fmt.Printf("latency average    : %s\n", harness.Dur(f.Avg))
-	fmt.Printf("latency median(p50): %s\n", harness.Dur(f.P50))
-	fmt.Printf("latency p95        : %s\n", harness.Dur(f.P95))
-	fmt.Printf("latency p99        : %s\n", harness.Dur(f.P99))
-	fmt.Printf("latency max        : %s\n", harness.Dur(f.Mx))
+	fmt.Printf("journal            : %s\n", journalLabel(durable, async))
+	// Match latency (intended -> matched). When not durable this is the only SLO,
+	// so it keeps the original "latency ..." labels; when durable it is the
+	// internal SLO alongside durable-ack below.
+	const w = 24 // pad so the ':' column lines up across both blocks
+	label := "latency"
+	if durable {
+		label = "match" // distinguish the internal SLO from durable-ack below
+	}
+	fmt.Printf("%-*s: %s\n", w, label+" average", harness.Dur(f.Avg))
+	fmt.Printf("%-*s: %s\n", w, label+" median(p50)", harness.Dur(f.P50))
+	fmt.Printf("%-*s: %s\n", w, label+" p95", harness.Dur(f.P95))
+	fmt.Printf("%-*s: %s\n", w, label+" p99", harness.Dur(f.P99))
+	fmt.Printf("%-*s: %s\n", w, label+" max", harness.Dur(f.Mx))
+	if durable {
+		fmt.Printf("%-*s: %s\n", w, "durable-ack average", harness.Dur(hDur.Avg()))
+		fmt.Printf("%-*s: %s\n", w, "durable-ack median(p50)", harness.Dur(hDur.Pct(50)))
+		fmt.Printf("%-*s: %s\n", w, "durable-ack p95", harness.Dur(hDur.Pct(95)))
+		fmt.Printf("%-*s: %s\n", w, "durable-ack p99", harness.Dur(hDur.Pct(99)))
+		fmt.Printf("%-*s: %s\n", w, "durable-ack max", harness.Dur(hDur.Max()))
+	}
 }

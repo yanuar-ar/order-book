@@ -396,6 +396,12 @@ func (e *Engine) MarketIDs() []types.MarketID {
 // After Drain the watermark equals Seq, so every ack is released.
 func (e *Engine) Acks() []types.Ack { return releasedAcks(e.core.acks, e.seq.DurableSeq()) }
 
+// AcksAll returns every ack appended so far, ungated by durability — for
+// benchmark harnesses that track the durable watermark (DurableSeq) themselves
+// with their own cursor, avoiding the O(prefix) rescan that Acks() does each
+// call. Production callers must use Acks().
+func (e *Engine) AcksAll() []types.Ack { return e.core.acks }
+
 // releasedAcks returns the prefix of acks whose Seq is at or below durable. Acks
 // are appended in ascending Seq order (one per command, in route order, with
 // resting-stop commands simply contributing none), so the durable set is a

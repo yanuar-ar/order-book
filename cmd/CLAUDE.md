@@ -34,7 +34,20 @@ paths; their shared building blocks live in `cmd/internal/harness`.
   **coordinated-omission-correct**: command `i` is scheduled at `start + i/rate`
   and latency is measured from that intended time. Live-mid generation and TUI
   depth reads happen between control steps (workers idle), so they don't race
-  the matcher in parallel topology.
+  the matcher in parallel topology. `-durable` (+ optional `-wal`, `-flushcap`)
+  journals to a real WAL and reports **two SLOs** separately: *internal match
+  latency* (intended→matched) and *durable-ack latency* (intended→WAL-durable,
+  tracked O(1) via `AcksAll`+`DurableSeq` with a cursor — no per-command rescan).
+  `-async` journals off the matcher goroutine; comparing `loadtest` vs
+  `loadtest -async` shows async keeping match-latency tails in µs (vs ms when
+  fsync blocks the matcher inline).
+
+## Make targets (sync default, async variant)
+
+Both bench tools cover sync and async via separate targets; the default is the
+inline (sync) journaller. `make throughput` / `make loadtest` journal durably
+with the sync journaller; `make throughput-async` / `make loadtest-async` fsync
+off-thread. Tune the group-commit batch with `FLUSHCAP=` and load with `TPS=`.
 
 ## Shared kit (`cmd/internal/harness`)
 

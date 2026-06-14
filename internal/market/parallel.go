@@ -254,7 +254,16 @@ func (pe *ParallelEngine) Filters() map[types.MarketID]types.MarketFilters { ret
 
 // Acks returns the durable acks (Seq <= durableSeq). The watermark lives on the
 // shared sequencer, so serial and parallel engines gate identically.
-func (pe *ParallelEngine) Acks() []types.Ack { return releasedAcks(pe.core.acks, pe.seq.DurableSeq()) }
+func (pe *ParallelEngine) Acks() []types.Ack {
+	return releasedAcks(pe.core.acks, pe.seq.DurableSeq())
+}
+
+// AcksAll returns every ack appended so far, ungated by durability (see
+// Engine.AcksAll). DurableSeq exposes the watermark so a harness can gate them.
+func (pe *ParallelEngine) AcksAll() []types.Ack { return pe.core.acks }
+
+// DurableSeq returns the highest Seq whose WAL bytes have been fsynced.
+func (pe *ParallelEngine) DurableSeq() types.Seq { return pe.seq.DurableSeq() }
 
 // Seq returns the last assigned sequence number.
 func (pe *ParallelEngine) Seq() types.Seq { return pe.seq.Seq() }

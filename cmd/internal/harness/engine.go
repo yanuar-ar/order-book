@@ -44,7 +44,9 @@ type Engine interface {
 	Step() bool
 	Drain()
 	Acks() []types.Ack
+	AcksAll() []types.Ack // ungated acks; pair with DurableSeq for O(1) durable-ack tracking
 	Seq() types.Seq
+	DurableSeq() types.Seq
 	Shard(types.MarketID) *market.Shard
 	Ledger() *balance.Ledger
 	MarketIDs() []types.MarketID
