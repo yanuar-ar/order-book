@@ -40,16 +40,18 @@ func main() {
 	}
 
 	mcfg := market.Config{
-		Markets:      specs,
-		Filters:      buildMarketFilters(cfg),
-		QtyScale:     cfg.QtyScale,
-		FeeScale:     cfg.FeeScale,
-		MakerFee:     cfg.MakerFee,
-		TakerFee:     cfg.TakerFee,
-		RingSize:     cfg.RingSize,
-		Journal:      walW,
-		AsyncJournal: cfg.JournalMode == "async",
-		JournalRing:  cfg.JournalRing,
+		Markets:         specs,
+		Filters:         buildMarketFilters(cfg),
+		QtyScale:        cfg.QtyScale,
+		FeeScale:        cfg.FeeScale,
+		MakerFee:        cfg.MakerFee,
+		TakerFee:        cfg.TakerFee,
+		RingSize:        cfg.RingSize,
+		Journal:         walW,
+		AsyncJournal:    cfg.JournalMode == "async",
+		JournalRing:     cfg.JournalRing,
+		ReplicationMode: cfg.ReplicationMode,
+		ReplicationRing: cfg.ReplicationRing,
 	}
 	eng, err := market.Recover(mcfg, cfg.WALPath, cfg.SnapshotPath, func(format string, args ...any) {
 		log.Warn("recovery fallback", slog.String("detail", fmt.Sprintf(format, args...)))

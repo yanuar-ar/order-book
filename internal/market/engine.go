@@ -246,6 +246,16 @@ type Config struct {
 	// JournalCore pins the async journaller goroutine to a core; <= 0 disables
 	// pinning (the default, and always a no-op on non-Linux).
 	JournalCore int
+	// ReplicationMode selects the hot-standby replicator: "off" (the default, no
+	// standby), "sync" (acks gate on the standby's replicated watermark), or
+	// "async" (stream off the critical path, bounded lag). Wired by buildReplicator
+	// (U5); the ack gate consumes the watermark in U3.
+	ReplicationMode string
+	// ReplicationRing is the replicator hand-off ring capacity (power of two; 0 ->
+	// default). ReplicationCore pins the replicator consumer goroutine (<= 0
+	// disables, the default).
+	ReplicationRing uint64
+	ReplicationCore int
 	// SuppressStops installs a no-op activation sink. Set during replay, where
 	// stop activations are read from the WAL rather than regenerated.
 	SuppressStops bool
