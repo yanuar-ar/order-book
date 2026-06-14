@@ -98,6 +98,16 @@ type Command struct {
 	// ClientTsNanos is a bench-only timestamp for latency correlation. It is
 	// never read by engine logic and does not affect determinism.
 	ClientTsNanos int64
+
+	// Epoch is the leadership term the sequencer stamped this command under. It is
+	// envelope metadata (like Seq/TsNanos), not order semantics: matching and
+	// settlement never read it, so it does not affect book/ledger state or the
+	// fingerprint. It rides on the command (not just the WAL record) so it reaches
+	// the async journaller/replicator consumers through the SPSC ring. Replay and
+	// the live path fence on it: a command whose epoch is below the node's current
+	// epoch is rejected — this is how a promoted standby rejects a zombie old
+	// primary. Epoch increments once per promotion.
+	Epoch uint64
 }
 
 // Fill is the result of one execution between two resting/aggressing orders.

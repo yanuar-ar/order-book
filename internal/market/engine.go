@@ -428,6 +428,13 @@ func (e *Engine) DurableSeq() types.Seq { return e.seq.DurableSeq() }
 // stepping resumes) so post-restore commands continue contiguously.
 func (e *Engine) SetSeq(s types.Seq) { e.seq.SetSeq(s) }
 
+// Epoch returns the current leadership term (0 until the first promotion).
+func (e *Engine) Epoch() uint64 { return e.seq.Epoch() }
+
+// SetEpoch primes the leadership term. Used by snapshot restore (to the
+// snapshot's epoch) and promotion (incremented). Quiesced-only, like SetSeq.
+func (e *Engine) SetEpoch(epoch uint64) { e.seq.SetEpoch(epoch) }
+
 // SyncJournal forces durability of journaled records through the current Seq. A
 // snapshot must be published only after the WAL is durable through its
 // watermark. It routes through the journaller (never touching the WAL writer

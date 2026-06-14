@@ -47,8 +47,9 @@ type Sequencer struct {
 	router     Router
 	clock      ClockFunc
 
-	seq types.Seq
-	rr  int // round-robin cursor over inputs
+	seq   types.Seq
+	epoch uint64 // leadership term; stamped on every command, bumped on promotion (U7)
+	rr    int    // round-robin cursor over inputs
 
 	// Durable-ack barrier (output-side only — never journaled, never affects Seq,
 	// timestamps, or fill order, so replay is byte-identical regardless of cadence).
@@ -149,6 +150,13 @@ func (s *Sequencer) setFlushCap(n int) {
 // snapshot's Seq. It must only be called while the engine is quiesced (before
 // live stepping resumes); it does not journal or route anything.
 func (s *Sequencer) SetSeq(seq types.Seq) { s.seq = seq }
+
+// Epoch returns the current leadership term stamped on outgoing commands.
+func (s *Sequencer) Epoch() uint64 { return s.epoch }
+
+// SetEpoch primes the leadership term. Like SetSeq it must only be called while
+// quiesced — at restore (to the snapshot's epoch) or at promotion (incremented).
+func (s *Sequencer) SetEpoch(epoch uint64) { s.epoch = epoch }
 
 // Inject enqueues a synthetic command (a stop activation) for sequencing. It is
 // called by market shards; returns false if the re-injection ring is full.
@@ -290,6 +298,7 @@ func (s *Sequencer) pollExternal() (types.Command, bool) {
 func (s *Sequencer) sequenceAndRoute(c *types.Command) error {
 	s.seq++
 	c.Seq = s.seq
+	c.Epoch = s.epoch     // leadership term, bumped once per promotion (U7)
 	c.TsNanos = s.clock() // wall-clock read happens only here
 	if err := s.journaller.Append(*c); err != nil {
 		return err

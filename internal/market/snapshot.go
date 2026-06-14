@@ -50,7 +50,7 @@ func (e *Engine) Snapshot(path string) error {
 	sections[secOpenMap] = encodeOpenMap(e.core.open)
 	sections[secBooks] = e.encodeBooks()
 	sections[secStops] = e.encodeStops()
-	return wal.WriteSnapshot(path, uint64(e.seq.Seq()), sections)
+	return wal.WriteSnapshot(path, uint64(e.seq.Seq()), e.seq.Epoch(), sections)
 }
 
 // Restore rebuilds a fresh engine from the snapshot at path using cfg (the same
@@ -60,7 +60,7 @@ func (e *Engine) Snapshot(path string) error {
 // replay does not re-trigger journaled activations; the caller re-enables them
 // via EnableStops once the tail is applied.
 func Restore(cfg Config, path string) (*Engine, error) {
-	seq, sections, err := wal.ReadSnapshot(path)
+	seq, epoch, sections, err := wal.ReadSnapshot(path)
 	if err != nil {
 		return nil, err // bad CRC / truncated → caller falls back to full replay
 	}
@@ -94,6 +94,7 @@ func Restore(cfg Config, path string) (*Engine, error) {
 	}
 
 	e.SetSeq(types.Seq(seq))
+	e.SetEpoch(epoch)
 
 	if err := e.selfCheck(); err != nil {
 		return nil, err
