@@ -16,7 +16,13 @@ sequencer, balance authority, and shards together. Provides both the serial
   speculative). After `Drain` the watermark equals `Seq`, so every ack releases
   and drain-then-read callers are unaffected. `Fatal()`/`DurableSeq()` expose the
   sequencer's barrier state; `ParallelEngine.Acks()` gates identically via the
-  shared `releasedAcks` helper and shared sequencer.
+  shared `releasedAcks` helper and shared sequencer. `Config.AsyncJournal` (via
+  `buildJournaller`, shared by both topologies) moves WAL fsync onto a dedicated
+  journaller goroutine — the path to 1M durable TPS; `Engine`/`ParallelEngine`
+  `Close` stop that goroutine before the host closes the WAL, and `Drain`/
+  `SyncJournal` barrier on it (`Sequencer.DrainJournal`) so snapshots never
+  persist state the WAL cannot back. The async path is proven behavior-transparent
+  by sync-vs-async state/ack equivalence and a byte-identical-WAL determinism test.
 - `parallel.go` — `ParallelEngine`: offloads matching to per-worker goroutines
   (configurable market→worker assignment) while keeping sequencing and the
   balance authority single-writer. Control drives ops in strict `Seq` order,

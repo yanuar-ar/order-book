@@ -30,9 +30,10 @@ type ParallelEngine struct {
 	ingress *spsc.RingCommand
 	impls   map[types.MarketID]*Shard
 
-	workers []*worker
-	stop    atomic.Bool
-	wg      sync.WaitGroup
+	workers    []*worker
+	journaller sequencer.Journaller // async journaller handle (nil for sync); Close stops it
+	stop       atomic.Bool
+	wg         sync.WaitGroup
 }
 
 // matching request kinds dispatched to a worker.
@@ -205,13 +206,15 @@ func NewParallelEngine(cfg Config, groups [][]types.MarketID) *ParallelEngine {
 	}
 
 	pe.core = &Core{shards: coreShards, ledger: ledger, open: make(map[types.OrderID]openOrder, 1024), filters: cfg.Filters, qtyScale: cfg.QtyScale}
+	pe.journaller = buildJournaller(cfg)
 	pe.seq = sequencer.New(sequencer.Config{
-		Reinject: reinject,
-		Inputs:   []*spsc.RingCommand{ingress},
-		Journal:  cfg.Journal,
-		Router:   pe.core,
-		Clock:    cfg.Clock,
-		FlushCap: cfg.FlushCap,
+		Reinject:   reinject,
+		Inputs:     []*spsc.RingCommand{ingress},
+		Journal:    cfg.Journal,
+		Journaller: pe.journaller,
+		Router:     pe.core,
+		Clock:      cfg.Clock,
+		FlushCap:   cfg.FlushCap,
 	})
 
 	for i, w := range pe.workers {
@@ -231,10 +234,12 @@ func (pe *ParallelEngine) Submit(c types.Command) bool { return pe.ingress.Push(
 // to workers and blocking for results.
 func (pe *ParallelEngine) Step() bool { return pe.seq.Step() }
 
-// Drain steps until no control work remains.
+// Drain steps until no control work remains, then waits for the journaller to
+// make every appended command durable so durableSeq == Seq.
 func (pe *ParallelEngine) Drain() {
 	for pe.seq.Step() {
 	}
+	_ = pe.seq.DrainJournal()
 }
 
 // Ledger exposes the balance ledger (read after Drain/Close for consistency).
@@ -249,7 +254,16 @@ func (pe *ParallelEngine) Filters() map[types.MarketID]types.MarketFilters { ret
 
 // Acks returns the durable acks (Seq <= durableSeq). The watermark lives on the
 // shared sequencer, so serial and parallel engines gate identically.
-func (pe *ParallelEngine) Acks() []types.Ack { return releasedAcks(pe.core.acks, pe.seq.DurableSeq()) }
+func (pe *ParallelEngine) Acks() []types.Ack {
+	return releasedAcks(pe.core.acks, pe.seq.DurableSeq())
+}
+
+// AcksAll returns every ack appended so far, ungated by durability (see
+// Engine.AcksAll). DurableSeq exposes the watermark so a harness can gate them.
+func (pe *ParallelEngine) AcksAll() []types.Ack { return pe.core.acks }
+
+// DurableSeq returns the highest Seq whose WAL bytes have been fsynced.
+func (pe *ParallelEngine) DurableSeq() types.Seq { return pe.seq.DurableSeq() }
 
 // Seq returns the last assigned sequence number.
 func (pe *ParallelEngine) Seq() types.Seq { return pe.seq.Seq() }
@@ -267,9 +281,13 @@ func (pe *ParallelEngine) MarketIDs() []types.MarketID {
 	return ids
 }
 
-// Close stops the worker goroutines and waits for them to exit. After Close,
-// books may be read directly without racing.
+// Close stops the worker goroutines and the async journaller (if any), waiting
+// for them to exit. After Close, books may be read directly without racing, and
+// the host may close the underlying Journal.
 func (pe *ParallelEngine) Close() {
 	pe.stop.Store(true)
 	pe.wg.Wait()
+	if pe.journaller != nil {
+		_ = pe.journaller.Close()
+	}
 }

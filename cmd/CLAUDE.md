@@ -14,10 +14,13 @@ paths; their shared building blocks live in `cmd/internal/harness`.
   generator. `-topology serial|parallel` (+ `-cores` for parallel) makes
   serial-vs-parallel a controlled comparison; run length is `-duration` or
   `-n`+`-rngseed` (the reproducible, deterministic latency-regression mode).
-  `-durable` (with optional `-wal <dir>`) journals to a real WAL with
-  group-commit fsync — the honest durable ceiling — and `-flushcap` tunes the
-  group-commit batch (commands per fsync; bigger amortizes I/O harder at the cost
-  of durable-ack latency). `-cpuprofile <path>` writes a CPU profile of the
+  `-journal` selects the journaling path: **`async`** (off-thread fsync — the 1M
+  durable path, **the default**), `sync` (inline group-commit fsync), or `none`
+  (no WAL, the raw matching ceiling). `-flushcap` tunes the group-commit batch
+  (commands per fsync; bigger amortizes I/O harder at the cost of durable-ack
+  latency); `-wal <dir>` overrides the temp WAL dir. On the dev machine: raw
+  ~1.4M, async durable ~1.3M, sync durable saturates lower with worse tails.
+  `-cpuprofile <path>` writes a CPU profile of the
   measured window (profiles the whole process; read the engine cost under
   `market.(*Engine).Step` and ignore the producer's backpressure-spin in
   `main.func1`). Renders the same live order-book TUI as `loadtest`
@@ -31,7 +34,22 @@ paths; their shared building blocks live in `cmd/internal/harness`.
   **coordinated-omission-correct**: command `i` is scheduled at `start + i/rate`
   and latency is measured from that intended time. Live-mid generation and TUI
   depth reads happen between control steps (workers idle), so they don't race
-  the matcher in parallel topology.
+  the matcher in parallel topology. `-journal async|sync|none` (default `async`,
+  + optional `-wal`, `-flushcap`) selects journaling; in the durable modes it
+  reports **two SLOs** separately: *internal match latency* (intended→matched) and
+  *durable-ack latency* (intended→WAL-durable, tracked O(1) via `AcksAll`+
+  `DurableSeq` with a cursor — no per-command rescan). Comparing `loadtest` vs
+  `loadtest -journal sync` shows async keeping match-latency tails in µs (vs tens
+  of ms when fsync blocks the matcher inline) — e.g. at 500k tps, match p99 ~10ms
+  async vs ~77ms sync.
+
+## Make targets (async default, sync variant)
+
+Both bench tools cover async and sync via separate targets; the default is the
+off-thread (async) journaller. `make throughput` / `make loadtest` journal
+durably with the async journaller; `make throughput-sync` / `make loadtest-sync`
+use the inline journaller for comparison. Tune the group-commit batch with
+`FLUSHCAP=` and load with `TPS=`.
 
 ## Shared kit (`cmd/internal/harness`)
 

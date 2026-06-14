@@ -44,7 +44,9 @@ type Engine interface {
 	Step() bool
 	Drain()
 	Acks() []types.Ack
+	AcksAll() []types.Ack // ungated acks; pair with DurableSeq for O(1) durable-ack tracking
 	Seq() types.Seq
+	DurableSeq() types.Seq
 	Shard(types.MarketID) *market.Shard
 	Ledger() *balance.Ledger
 	MarketIDs() []types.MarketID
@@ -71,7 +73,8 @@ func DefaultConfig() market.Config {
 func BuildEngine(topology string, groups [][]types.MarketID, cfg market.Config) (Engine, func(), error) {
 	switch topology {
 	case "serial":
-		return market.NewEngine(cfg), func() {}, nil
+		e := market.NewEngine(cfg)
+		return e, func() { _ = e.Close() }, nil
 	case "parallel":
 		pe := market.NewParallelEngine(cfg, groups)
 		return pe, pe.Close, nil

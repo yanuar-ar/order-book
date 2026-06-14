@@ -46,11 +46,20 @@ func main() {
 	users := flag.Int("users", 100, "account pool size")
 	view := flag.Int("market", 0, "market id to display (0=BTC,1=ETH,2=SOL)")
 	levels := flag.Int("levels", 16, "order-book depth levels to show per side")
-	durable := flag.Bool("durable", false, "journal to a real WAL (group-commit fsync) instead of the no-op journal — the honest durable ceiling")
-	walDir := flag.String("wal", "", "WAL directory for -durable (default: a temp dir, removed on exit)")
+	journal := flag.String("journal", "async", "journal mode: async (off-thread fsync, default — the 1M durable path) | sync (inline fsync) | none (no WAL, raw ceiling)")
+	walDir := flag.String("wal", "", "WAL directory for durable modes (default: a temp dir, removed on exit)")
 	flushCap := flag.Int("flushcap", 0, "group-commit batch ceiling (commands per fsync; 0 = engine default). Bigger amortizes fsync harder on the durable path")
 	cpuprofile := flag.String("cpuprofile", "", "write a CPU profile to this path for the measured window")
 	flag.Parse()
+
+	switch *journal {
+	case "async", "sync", "none":
+	default:
+		fmt.Println("invalid -journal:", *journal, "(want async | sync | none)")
+		return
+	}
+	durable := *journal != "none"
+	async := *journal == "async"
 
 	var groups [][]types.MarketID
 	if *topology == "parallel" {
@@ -65,7 +74,11 @@ func main() {
 
 	cfg := harness.DefaultConfig()
 	cfg.FlushCap = *flushCap
-	if *durable {
+	if async {
+		cfg.AsyncJournal = true
+		cfg.JournalBatchCap = *flushCap
+	}
+	if durable {
 		dir := *walDir
 		if dir == "" {
 			d, err := os.MkdirTemp("", "throughput-wal-")
@@ -101,7 +114,7 @@ func main() {
 	startSeq := eng.Seq()
 	total := *warmup + *n
 	title := "spot order-book throughput"
-	sub := subLine(*topology, *n, *warmup, *durable, groups)
+	sub := subLine(*topology, *n, *warmup, durable, async, groups)
 	h := harness.NewHist()
 	var framePtr atomic.Pointer[harness.Frame]
 	var stop atomic.Bool
@@ -198,11 +211,11 @@ func main() {
 	processed := int64(eng.Seq() - startSeq)
 	final := harness.BuildFrame(eng, types.MarketID(*view), *levels, h, title, sub, processed, elapsed, atomic.LoadInt64(&backpressure))
 	harness.Render(final)
-	printSummary(*topology, *n, *warmup, *rngseed, *durable, groups, processed, elapsed, atomic.LoadInt64(&produced), atomic.LoadInt64(&backpressure), h)
+	printSummary(*topology, *n, *warmup, *rngseed, durable, async, groups, processed, elapsed, atomic.LoadInt64(&produced), atomic.LoadInt64(&backpressure), h)
 }
 
 // subLine is the TUI sub-line: topology + run mode + (parallel) the worker map.
-func subLine(topology string, n, warmup int, durable bool, groups [][]types.MarketID) string {
+func subLine(topology string, n, warmup int, durable, async bool, groups [][]types.MarketID) string {
 	mode := "duration"
 	if n > 0 {
 		mode = fmt.Sprintf("fixed n=%d warmup=%d", n, warmup)
@@ -210,6 +223,9 @@ func subLine(topology string, n, warmup int, durable bool, groups [][]types.Mark
 	journal := "no-op journal"
 	if durable {
 		journal = "durable WAL"
+		if async {
+			journal = "durable WAL (async)"
+		}
 	}
 	if topology != "parallel" {
 		return "topology serial  " + mode + "  " + journal
@@ -229,7 +245,7 @@ func workerLayout(groups [][]types.MarketID) string {
 	return strings.Join(parts, "  ")
 }
 
-func printSummary(topology string, n, warmup int, rngseed int64, durable bool, groups [][]types.MarketID, processed int64, elapsed time.Duration, produced, backpressure int64, h *harness.Hist) {
+func printSummary(topology string, n, warmup int, rngseed int64, durable, async bool, groups [][]types.MarketID, processed int64, elapsed time.Duration, produced, backpressure int64, h *harness.Hist) {
 	fmt.Printf("\n==== throughput (%s topology) ====\n", topology)
 	if topology == "parallel" {
 		fmt.Printf("workers           : %s\n", workerLayout(groups))
@@ -237,6 +253,9 @@ func printSummary(topology string, n, warmup int, rngseed int64, durable bool, g
 	journal := "no-op (no fsync)"
 	if durable {
 		journal = "durable WAL (group-commit fsync)"
+		if async {
+			journal = "durable WAL (async, off-thread fsync)"
+		}
 	}
 	fmt.Printf("journal           : %s\n", journal)
 	if n > 0 {
@@ -248,6 +267,8 @@ func printSummary(topology string, n, warmup int, rngseed int64, durable bool, g
 	fmt.Printf("throughput        : %.0f cmd/s\n", float64(processed)/elapsed.Seconds())
 	fmt.Printf("produced          : %d\n", produced)
 	fmt.Printf("backpressure      : %d (producer waited for the engine)\n", backpressure)
-	fmt.Printf("latency p50/p95/p99/max (engine step): %s / %s / %s / %s\n",
-		harness.Dur(h.Pct(50)), harness.Dur(h.Pct(95)), harness.Dur(h.Pct(99)), harness.Dur(h.Max()))
+	fmt.Printf("engine step latency p50: %s\n", harness.Dur(h.Pct(50)))
+	fmt.Printf("engine step latency p95: %s\n", harness.Dur(h.Pct(95)))
+	fmt.Printf("engine step latency p99: %s\n", harness.Dur(h.Pct(99)))
+	fmt.Printf("engine step latency max: %s\n", harness.Dur(h.Max()))
 }

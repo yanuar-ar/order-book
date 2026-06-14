@@ -9,10 +9,20 @@ onward; it also drains market fills and applies settlement in deterministic
 
 - `sequencer.go` — `Sequencer`, the `Journal` and `Router` interfaces,
   `ClockFunc`. Fans in producer command rings + a priority re-inject ring (stop
-  activations), assigns order, journals, routes. `SetSeq` primes the counter to a
-  snapshot watermark during restore (quiesced only) so post-restore commands
-  continue contiguously. Also owns the **durable-ack barrier** (`DurableSeq`,
-  `Fatal`) — see below.
+  activations), assigns order, journals (via a `Journaller`), routes. `SetSeq`
+  primes the counter to a snapshot watermark during restore (quiesced only) so
+  post-restore commands continue contiguously. Owns the **durable-ack barrier**
+  flush-trigger policy (`DurableSeq`, `DrainJournal`, `Fatal`) — see below.
+- `journaller.go` — the `Journaller` seam (Append / Flush / Drain / DurableSeq /
+  Fatal / Close) and `SyncJournaller`, the default that journals inline on the
+  sequencer goroutine (the historical behavior; used by every test and replay).
+- `async_journaller.go` — `AsyncJournaller`: moves WAL Append + fsync onto a
+  dedicated consumer goroutine (the LMAX "Journaller") so the matcher never
+  blocks on durability. An SPSC journal ring carries records (FIFO → the on-disk
+  byte stream is identical to inline journaling), an atomic publishes
+  `durableSeq`, and `Append` backpressures (spins, never drops) when the ring is
+  full. An Append/Sync error latches a fatal the sequencer observes via
+  `Fatal()`. Selected by `market.Config.AsyncJournal`.
 
 ## Durable-ack barrier
 
@@ -36,9 +46,12 @@ exposed before its WAL bytes are durable.
   never journaled and never affect `Seq`, timestamps, or fill order — replay is
   byte-identical regardless of flush cadence. `FlushCap` governs durable
   throughput vs durable-ack latency: bigger batches amortize the WAL `write`+`fsync`
-  over more commands. The inline single-thread durable ceiling is the no-op
-  ceiling minus the sequencer's own I/O time (~980k cmd/s on the dev machine);
-  clearing 1M needs edge journalling (fsync off the sequencer thread), deferred.
+  over more commands. The inline (`SyncJournaller`) single-thread durable ceiling
+  is the no-op ceiling minus the sequencer's own I/O time (~820k cmd/s durable on
+  the dev machine); the **`AsyncJournaller`** lifts journaling off the matcher
+  goroutine and clears the **1M durable** target (~1.38M cmd/s measured). With
+  async, `DrainJournal` is the barrier that quiesce points (snapshot, drain-then-
+  read) use to wait for the consumer to catch up before reading durable state.
 - **Fail-stop.** A non-nil `Append`/`Sync` error latches a terminal `fatal`:
   `Step` becomes a no-op, `Run` exits, no pending ack is released, and the host
   (`cmd/engine`) / snapshotter surface it via `Fatal()`. The WAL is the source of
