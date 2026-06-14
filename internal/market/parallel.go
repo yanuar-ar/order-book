@@ -252,10 +252,11 @@ func (pe *ParallelEngine) Shard(m types.MarketID) *Shard { return pe.impls[m] }
 // Filters returns the per-market order filters (read access for invariants).
 func (pe *ParallelEngine) Filters() map[types.MarketID]types.MarketFilters { return pe.core.filters }
 
-// Acks returns the durable acks (Seq <= durableSeq). The watermark lives on the
-// shared sequencer, so serial and parallel engines gate identically.
+// Acks returns the releasable acks (Seq <= min(durableSeq, replicatedSeq)). The
+// watermark lives on the shared sequencer, so serial and parallel engines gate
+// identically — including the replication gate.
 func (pe *ParallelEngine) Acks() []types.Ack {
-	return releasedAcks(pe.core.acks, pe.seq.DurableSeq())
+	return releasedAcks(pe.core.acks, pe.seq.ReleaseSeq())
 }
 
 // AcksAll returns every ack appended so far, ungated by durability (see

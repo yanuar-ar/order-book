@@ -404,7 +404,7 @@ func (e *Engine) MarketIDs() []types.MarketID {
 // Acks above durableSeq are speculative (their command is matched in-memory but
 // not yet on disk) and must not be observed until a flush makes them durable.
 // After Drain the watermark equals Seq, so every ack is released.
-func (e *Engine) Acks() []types.Ack { return releasedAcks(e.core.acks, e.seq.DurableSeq()) }
+func (e *Engine) Acks() []types.Ack { return releasedAcks(e.core.acks, e.seq.ReleaseSeq()) }
 
 // AcksAll returns every ack appended so far, ungated by durability — for
 // benchmark harnesses that track the durable watermark (DurableSeq) themselves

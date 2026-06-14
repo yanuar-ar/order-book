@@ -44,6 +44,7 @@ type Sequencer struct {
 	inputs     []*spsc.RingCommand // external producers (round-robin)
 	fills      []*spsc.RingFill    // per-market fill rings
 	journaller Journaller          // WAL Append + fsync + durable watermark
+	replicator Replicator          // hot-standby stream + replicated watermark
 	router     Router
 	clock      ClockFunc
 
@@ -85,6 +86,9 @@ type Config struct {
 	// AsyncJournaller that fsyncs off the sequencer goroutine. Takes precedence
 	// over Journal.
 	Journaller Journaller
+	// Replicator, when set, streams sequenced commands to a hot standby. Nil ->
+	// NopReplicator (replication off), so the ack gate stays durableSeq-only.
+	Replicator Replicator
 	Router     Router
 	Clock      ClockFunc
 	// FlushCap overrides the group-commit batch ceiling (0 -> defaultFlushCap).
@@ -101,11 +105,16 @@ func New(cfg Config) *Sequencer {
 	if j == nil {
 		j = NewSyncJournaller(cfg.Journal)
 	}
+	r := cfg.Replicator
+	if r == nil {
+		r = NopReplicator{}
+	}
 	return &Sequencer{
 		reinject:   cfg.Reinject,
 		inputs:     cfg.Inputs,
 		fills:      cfg.Fills,
 		journaller: j,
+		replicator: r,
 		router:     cfg.Router,
 		clock:      cfg.Clock,
 		flushCap:   cap,
@@ -118,6 +127,34 @@ func (s *Sequencer) Seq() types.Seq { return s.seq }
 // DurableSeq returns the highest Seq whose WAL bytes have been fsynced. Output
 // (acks) at or below this watermark is safe to release; above it is speculative.
 func (s *Sequencer) DurableSeq() types.Seq { return s.journaller.DurableSeq() }
+
+// ReplicatedSeq returns the highest Seq the standby has durably applied (the
+// maximum sentinel when replication is off).
+func (s *Sequencer) ReplicatedSeq() types.Seq { return s.replicator.ReplicatedSeq() }
+
+// ReleaseSeq is the highest Seq whose ack is safe to release: a command is
+// confirmed only once it is both locally durable AND replicated, so the gate is
+// min(durableSeq, replicatedSeq). With replication off the replicated watermark
+// is +inf, so this collapses to durableSeq and behavior is unchanged. The
+// degrade-to-solo command (U8) raises the gate to durableSeq-only past its Seq.
+func (s *Sequencer) ReleaseSeq() types.Seq {
+	d := s.journaller.DurableSeq()
+	r := s.replicator.ReplicatedSeq()
+	if r < d {
+		return r
+	}
+	return d
+}
+
+// DrainReplication blocks until the standby has durably applied every replicated
+// command so far (or a fatal latches). Quiesce points use it alongside
+// DrainJournal so a snapshot never captures state the standby has not backed.
+func (s *Sequencer) DrainReplication() error {
+	if s.fatal != nil {
+		return s.fatal
+	}
+	return s.replicator.Drain()
+}
 
 // DrainJournal blocks until the journaller has made every appended command
 // durable (DurableSeq catches up to the last appended Seq). For the async
@@ -213,6 +250,12 @@ func (s *Sequencer) Step() bool {
 		// journaller always reports nil here, so this costs it nothing.
 		s.fatal = err
 		return did
+	} else if err := s.replicator.Fatal(); err != nil {
+		// Same for a replicator that died on its consumer goroutine: in sync mode
+		// the ack gate is frozen at replicatedSeq, so halt rather than leave the
+		// engine silently un-replicated. NopReplicator always reports nil here.
+		s.fatal = err
+		return did
 	}
 	if s.unsynced > 0 && s.unsynced >= s.flushCap {
 		// Batch ceiling reached under load: amortize the fsync (the LMAX
@@ -301,6 +344,12 @@ func (s *Sequencer) sequenceAndRoute(c *types.Command) error {
 	c.Epoch = s.epoch     // leadership term, bumped once per promotion (U7)
 	c.TsNanos = s.clock() // wall-clock read happens only here
 	if err := s.journaller.Append(*c); err != nil {
+		return err
+	}
+	// Replicate after the durable append so the standby never gets ahead of the
+	// primary's WAL. Replicate is non-blocking (a slow standby stalls acks, not
+	// matching); a transport failure latches the same fail-stop as a journal error.
+	if err := s.replicator.Replicate(*c); err != nil {
 		return err
 	}
 	s.router.OnCommand(*c)
