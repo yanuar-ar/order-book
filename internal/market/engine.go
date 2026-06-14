@@ -228,6 +228,9 @@ type Config struct {
 	Journal  sequencer.Journal   // nil -> no-op (in-memory) journal
 	Clock    sequencer.ClockFunc // nil -> deterministic counter
 	CapHint  int
+	// FlushCap overrides the group-commit batch ceiling (0 -> sequencer default).
+	// On the durable path it sets how many commands amortize one fsync.
+	FlushCap int
 	// SuppressStops installs a no-op activation sink. Set during replay, where
 	// stop activations are read from the WAL rather than regenerated.
 	SuppressStops bool
@@ -279,6 +282,7 @@ func NewEngine(cfg Config) *Engine {
 		Journal:  cfg.Journal,
 		Router:   core,
 		Clock:    cfg.Clock,
+		FlushCap: cfg.FlushCap,
 	})
 	var sink matching.Sink = reinjectSink{seq: seq}
 	if cfg.SuppressStops {

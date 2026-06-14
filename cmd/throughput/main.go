@@ -47,6 +47,7 @@ func main() {
 	levels := flag.Int("levels", 16, "order-book depth levels to show per side")
 	durable := flag.Bool("durable", false, "journal to a real WAL (group-commit fsync) instead of the no-op journal — the honest durable ceiling")
 	walDir := flag.String("wal", "", "WAL directory for -durable (default: a temp dir, removed on exit)")
+	flushCap := flag.Int("flushcap", 0, "group-commit batch ceiling (commands per fsync; 0 = engine default). Bigger amortizes fsync harder on the durable path")
 	flag.Parse()
 
 	var groups [][]types.MarketID
@@ -61,6 +62,7 @@ func main() {
 	}
 
 	cfg := harness.DefaultConfig()
+	cfg.FlushCap = *flushCap
 	if *durable {
 		dir := *walDir
 		if dir == "" {

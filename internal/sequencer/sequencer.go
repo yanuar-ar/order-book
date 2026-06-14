@@ -72,10 +72,9 @@ type Sequencer struct {
 }
 
 // defaultFlushCap is the group-commit batch ceiling: a flush fires at the latest
-// when this many records have been appended since the last fsync. It is an
-// unexported constant, not a config knob — the benchmark-driven value (and any
-// promotion to Config) is deferred follow-up work. Tests override it via
-// setFlushCap.
+// when this many records have been appended since the last fsync. On the durable
+// path this directly sets how many commands amortize one fsync, so it governs
+// durable throughput vs durable-ack latency. Config.FlushCap overrides it.
 const defaultFlushCap = 64
 
 // Config wires a sequencer.
@@ -86,10 +85,16 @@ type Config struct {
 	Journal  Journal
 	Router   Router
 	Clock    ClockFunc
+	// FlushCap overrides the group-commit batch ceiling (0 -> defaultFlushCap).
+	FlushCap int
 }
 
 // New returns a sequencer. A nil Reinject ring is allowed (no stop re-injection).
 func New(cfg Config) *Sequencer {
+	cap := cfg.FlushCap
+	if cap <= 0 {
+		cap = defaultFlushCap
+	}
 	return &Sequencer{
 		reinject: cfg.Reinject,
 		inputs:   cfg.Inputs,
@@ -97,7 +102,7 @@ func New(cfg Config) *Sequencer {
 		journal:  cfg.Journal,
 		router:   cfg.Router,
 		clock:    cfg.Clock,
-		flushCap: defaultFlushCap,
+		flushCap: cap,
 	}
 }
 

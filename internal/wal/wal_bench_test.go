@@ -31,5 +31,12 @@ func BenchmarkAppend(b *testing.B) {
 		if err := w.Append(rec); err != nil {
 			b.Fatalf("append: %v", err)
 		}
+		// Group-commit periodically so the pending buffer stays bounded (and
+		// reaches steady capacity → zero alloc), mirroring the sequencer's flush.
+		if i%256 == 255 {
+			if err := w.Sync(); err != nil {
+				b.Fatalf("sync: %v", err)
+			}
+		}
 	}
 }
