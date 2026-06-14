@@ -19,6 +19,7 @@ import (
 	"flag"
 	"fmt"
 	"math/rand"
+	"os"
 	"runtime"
 	"strings"
 	"sync/atomic"
@@ -27,6 +28,7 @@ import (
 	"github.com/yanuar-ar/order-book/cmd/internal/harness"
 	"github.com/yanuar-ar/order-book/internal/platform"
 	"github.com/yanuar-ar/order-book/internal/types"
+	"github.com/yanuar-ar/order-book/internal/wal"
 )
 
 const latSample = 256 // sample 1 in N processed ops for latency
@@ -43,6 +45,9 @@ func main() {
 	users := flag.Int("users", 100, "account pool size")
 	view := flag.Int("market", 0, "market id to display (0=BTC,1=ETH,2=SOL)")
 	levels := flag.Int("levels", 16, "order-book depth levels to show per side")
+	durable := flag.Bool("durable", false, "journal to a real WAL (group-commit fsync) instead of the no-op journal — the honest durable ceiling")
+	walDir := flag.String("wal", "", "WAL directory for -durable (default: a temp dir, removed on exit)")
+	flushCap := flag.Int("flushcap", 0, "group-commit batch ceiling (commands per fsync; 0 = engine default). Bigger amortizes fsync harder on the durable path")
 	flag.Parse()
 
 	var groups [][]types.MarketID
@@ -56,7 +61,29 @@ func main() {
 		runtime.GOMAXPROCS(3)
 	}
 
-	eng, cleanup, err := harness.BuildEngine(*topology, groups, harness.DefaultConfig())
+	cfg := harness.DefaultConfig()
+	cfg.FlushCap = *flushCap
+	if *durable {
+		dir := *walDir
+		if dir == "" {
+			d, err := os.MkdirTemp("", "throughput-wal-")
+			if err != nil {
+				fmt.Println("temp WAL dir:", err)
+				return
+			}
+			dir = d
+			defer os.RemoveAll(dir)
+		}
+		w, err := wal.OpenWriter(dir, 0)
+		if err != nil {
+			fmt.Println("open WAL:", err)
+			return
+		}
+		defer w.Close()
+		cfg.Journal = w
+	}
+
+	eng, cleanup, err := harness.BuildEngine(*topology, groups, cfg)
 	if err != nil {
 		fmt.Println(err)
 		return
@@ -72,7 +99,7 @@ func main() {
 	startSeq := eng.Seq()
 	total := *warmup + *n
 	title := "spot order-book throughput"
-	sub := subLine(*topology, *n, *warmup, groups)
+	sub := subLine(*topology, *n, *warmup, *durable, groups)
 	h := harness.NewHist()
 	var framePtr atomic.Pointer[harness.Frame]
 	var stop atomic.Bool
@@ -155,19 +182,23 @@ func main() {
 	processed := int64(eng.Seq() - startSeq)
 	final := harness.BuildFrame(eng, types.MarketID(*view), *levels, h, title, sub, processed, elapsed, atomic.LoadInt64(&backpressure))
 	harness.Render(final)
-	printSummary(*topology, *n, *warmup, *rngseed, groups, processed, elapsed, atomic.LoadInt64(&produced), atomic.LoadInt64(&backpressure), h)
+	printSummary(*topology, *n, *warmup, *rngseed, *durable, groups, processed, elapsed, atomic.LoadInt64(&produced), atomic.LoadInt64(&backpressure), h)
 }
 
 // subLine is the TUI sub-line: topology + run mode + (parallel) the worker map.
-func subLine(topology string, n, warmup int, groups [][]types.MarketID) string {
+func subLine(topology string, n, warmup int, durable bool, groups [][]types.MarketID) string {
 	mode := "duration"
 	if n > 0 {
 		mode = fmt.Sprintf("fixed n=%d warmup=%d", n, warmup)
 	}
-	if topology != "parallel" {
-		return "topology serial  " + mode
+	journal := "no-op journal"
+	if durable {
+		journal = "durable WAL"
 	}
-	return "topology parallel  " + mode + "  " + workerLayout(groups)
+	if topology != "parallel" {
+		return "topology serial  " + mode + "  " + journal
+	}
+	return "topology parallel  " + mode + "  " + journal + "  " + workerLayout(groups)
 }
 
 func workerLayout(groups [][]types.MarketID) string {
@@ -182,11 +213,16 @@ func workerLayout(groups [][]types.MarketID) string {
 	return strings.Join(parts, "  ")
 }
 
-func printSummary(topology string, n, warmup int, rngseed int64, groups [][]types.MarketID, processed int64, elapsed time.Duration, produced, backpressure int64, h *harness.Hist) {
+func printSummary(topology string, n, warmup int, rngseed int64, durable bool, groups [][]types.MarketID, processed int64, elapsed time.Duration, produced, backpressure int64, h *harness.Hist) {
 	fmt.Printf("\n==== throughput (%s topology) ====\n", topology)
 	if topology == "parallel" {
 		fmt.Printf("workers           : %s\n", workerLayout(groups))
 	}
+	journal := "no-op (no fsync)"
+	if durable {
+		journal = "durable WAL (group-commit fsync)"
+	}
+	fmt.Printf("journal           : %s\n", journal)
 	if n > 0 {
 		fmt.Printf("mode              : fixed count n=%d warmup=%d rngseed=%d (reproducible)\n", n, warmup, rngseed)
 	} else {

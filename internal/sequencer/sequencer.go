@@ -22,6 +22,10 @@ import (
 type ClockFunc func() int64
 
 // Journal persists sequenced commands. *wal.Writer satisfies it.
+//
+// Append must not retain Record.Payload beyond the call — the sequencer passes a
+// reusable buffer and overwrites it on the next command. A consumer that stores
+// records must copy the payload.
 type Journal interface {
 	Append(wal.Record) error
 }
@@ -46,6 +50,11 @@ type Sequencer struct {
 	seq types.Seq
 	rr  int // round-robin cursor over inputs
 
+	// payloadBuf is a reusable command-encode buffer so journaling a command
+	// allocates nothing on the hot path. Aliased into the WAL Record's Payload;
+	// safe because Journal.Append must not retain it past the call.
+	payloadBuf [types.CommandSize]byte
+
 	// Durable-ack barrier (output-side only — never journaled, never affects Seq,
 	// timestamps, or fill order, so replay is byte-identical regardless of cadence):
 	//   durableSeq is the highest Seq whose WAL bytes have been fsynced.
@@ -63,10 +72,9 @@ type Sequencer struct {
 }
 
 // defaultFlushCap is the group-commit batch ceiling: a flush fires at the latest
-// when this many records have been appended since the last fsync. It is an
-// unexported constant, not a config knob — the benchmark-driven value (and any
-// promotion to Config) is deferred follow-up work. Tests override it via
-// setFlushCap.
+// when this many records have been appended since the last fsync. On the durable
+// path this directly sets how many commands amortize one fsync, so it governs
+// durable throughput vs durable-ack latency. Config.FlushCap overrides it.
 const defaultFlushCap = 64
 
 // Config wires a sequencer.
@@ -77,10 +85,16 @@ type Config struct {
 	Journal  Journal
 	Router   Router
 	Clock    ClockFunc
+	// FlushCap overrides the group-commit batch ceiling (0 -> defaultFlushCap).
+	FlushCap int
 }
 
 // New returns a sequencer. A nil Reinject ring is allowed (no stop re-injection).
 func New(cfg Config) *Sequencer {
+	cap := cfg.FlushCap
+	if cap <= 0 {
+		cap = defaultFlushCap
+	}
 	return &Sequencer{
 		reinject: cfg.Reinject,
 		inputs:   cfg.Inputs,
@@ -88,7 +102,7 @@ func New(cfg Config) *Sequencer {
 		journal:  cfg.Journal,
 		router:   cfg.Router,
 		clock:    cfg.Clock,
-		flushCap: defaultFlushCap,
+		flushCap: cap,
 	}
 }
 
@@ -261,11 +275,12 @@ func (s *Sequencer) sequenceAndRoute(c *types.Command) error {
 	s.seq++
 	c.Seq = s.seq
 	c.TsNanos = s.clock() // wall-clock read happens only here
+	n := types.EncodeCommandInto(s.payloadBuf[:], *c)
 	if err := s.journal.Append(wal.Record{
 		Seq:     uint64(s.seq),
 		TsNanos: c.TsNanos,
 		Type:    uint16(c.Type),
-		Payload: types.EncodeCommand(*c),
+		Payload: s.payloadBuf[:n],
 	}); err != nil {
 		return err
 	}

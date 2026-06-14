@@ -211,6 +211,7 @@ func NewParallelEngine(cfg Config, groups [][]types.MarketID) *ParallelEngine {
 		Journal:  cfg.Journal,
 		Router:   pe.core,
 		Clock:    cfg.Clock,
+		FlushCap: cfg.FlushCap,
 	})
 
 	for i, w := range pe.workers {
