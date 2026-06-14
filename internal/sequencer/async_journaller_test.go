@@ -2,8 +2,10 @@ package sequencer
 
 import (
 	"errors"
+	"runtime"
 	"testing"
 
+	"github.com/yanuar-ar/order-book/internal/spsc"
 	"github.com/yanuar-ar/order-book/internal/types"
 	"github.com/yanuar-ar/order-book/internal/wal"
 )
@@ -146,6 +148,40 @@ func TestAsyncJournallerFatalOnSyncError(t *testing.T) {
 		t.Fatalf("durableSeq = %d, want 0 (fsync never succeeded)", got)
 	}
 	_ = aj.Close()
+}
+
+// ---- U3: a sequencer wired with an async journaller halts on its fatal ----
+
+func TestSequencerHaltsOnAsyncJournallerFatal(t *testing.T) {
+	boom := errors.New("async io down")
+	fj := &failingJournal{failAt: 5, err: boom}
+	aj := NewAsyncJournaller(fj, 0, 1, -1) // cap 1 → records 1..4 durable, 5th fails
+	defer aj.Close()
+
+	in := spsc.NewCommand(64)
+	r := &fakeRouter{}
+	s := New(Config{Inputs: []*spsc.RingCommand{in}, Journaller: aj, Router: r, Clock: func() int64 { return 1 }})
+	for i := 1; i <= 10; i++ {
+		in.Push(cmd(types.OrderID(i)))
+	}
+
+	// Step until the async fatal propagates (bounded; either Append returns it on
+	// the busy path or the idle Fatal() check catches it).
+	var fatal error
+	for i := 0; i < 200000 && fatal == nil; i++ {
+		s.Step()
+		fatal = s.Fatal()
+		runtime.Gosched()
+	}
+	if !errors.Is(fatal, boom) {
+		t.Fatalf("sequencer Fatal = %v, want %v", fatal, boom)
+	}
+	if s.Step() {
+		t.Fatalf("Step did work after fatal latched")
+	}
+	if got := s.DurableSeq(); got >= 5 {
+		t.Fatalf("durableSeq = %d, want < 5 (failure at the 5th record; no ack above it)", got)
+	}
 }
 
 // ---- Zero-alloc: Append must not allocate on the producer hot path ----

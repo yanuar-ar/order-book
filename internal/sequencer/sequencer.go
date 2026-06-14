@@ -181,6 +181,13 @@ func (s *Sequencer) Step() bool {
 			return did
 		}
 		did = true
+	} else if err := s.journaller.Fatal(); err != nil {
+		// Fully idle, but an async journaller died on its own goroutine: halt so
+		// no further output is released above the frozen durableSeq. On the busy
+		// path the failure surfaces through Append/flush instead; the sync
+		// journaller always reports nil here, so this costs it nothing.
+		s.fatal = err
+		return did
 	}
 	if s.unsynced > 0 && s.unsynced >= s.flushCap {
 		// Batch ceiling reached under load: amortize the fsync (the LMAX
